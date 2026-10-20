@@ -1,0 +1,310 @@
+{
+  "name": "C - Safe Local Test Notifications",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-notify",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "350ad398-521e-458d-87cc-1d13b75fd2da",
+      "name": "Matches completed webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "c19ecfe7-edb4-47fe-b87b-c390c6842f41"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/workflows/notification-messages",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { batch_id: $json.body.batch_id } }}",
+        "options": {
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "c3b28b86-d24a-477c-bd00-710123e1e3cb",
+      "name": "Build test-inbox messages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const page = $input.first().json;\nconst messages = page.messages || [];\nreturn messages.map((message, index) => ({ json: { ...message, is_last: index === messages.length - 1, continue_after_page: page.continue_after_page === true } }));"
+      },
+      "id": "4acbdc94-46cd-4ef0-b796-2b6eac31e70f",
+      "name": "One email per applicant",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $json.from }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {}
+      },
+      "id": "04ecfe05-c073-4bd2-89d8-4db25fd2dd97",
+      "name": "Send through local Mailpit SMTP",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        940,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/workflows/notifications/complete",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { batch_id: $('One email per applicant').item.json.batch_id, applicant_id: $('One email per applicant').item.json.applicant_id, claim_id: $('One email per applicant').item.json.claim_id, delivered: true, is_last: $('One email per applicant').item.json.is_last, continue_after_page: $('One email per applicant').item.json.continue_after_page } }}",
+        "options": {
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "2a2c8464-03b9-4a84-84a4-ed1c93692553",
+      "name": "Mark test delivery complete",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1180,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.continue_after_page && $json.is_last }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c1a56f92-8640-4e68-a22b-2be9c5884601",
+      "name": "Continue only when another bounded page is available",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://n8n:5678/webhook/loan-notify",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { batch_id: $('Matches completed webhook').first().json.body.batch_id } }}",
+        "options": {
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "77cb0181-f9c5-4f41-b074-6f81b4b23aa8",
+      "name": "Continue next notification page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "id": "81b1d344-d449-4bc2-ae25-2e64f95cde22",
+      "name": "Authorize internal notification trigger",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        400,
+        240
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.headers[\"x-workflow-token\"] }}",
+              "rightValue": "={{ $env.N8N_SERVICE_TOKEN }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Build test-inbox messages": {
+      "main": [
+        [
+          {
+            "node": "One email per applicant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One email per applicant": {
+      "main": [
+        [
+          {
+            "node": "Send through local Mailpit SMTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send through local Mailpit SMTP": {
+      "main": [
+        [
+          {
+            "node": "Mark test delivery complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark test delivery complete": {
+      "main": [
+        [
+          {
+            "node": "Continue only when another bounded page is available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Continue only when another bounded page is available": {
+      "main": [
+        [
+          {
+            "node": "Continue next notification page",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Matches completed webhook": {
+      "main": [
+        [
+          {
+            "node": "Authorize internal notification trigger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authorize internal notification trigger": {
+      "main": [
+        [
+          {
+            "node": "Build test-inbox messages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "220593b2-7aa9-45cf-89b0-f3e4135d5678",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "nodeGroups": [
+    {
+      "id": "31a7fd85-2fa8-4eb1-a548-3129722e38a3",
+      "name": "Deliver bounded test notifications",
+      "description": "Builds safe recipient messages, sends them to Mailpit, then records delivery before continuing bounded pages.",
+      "nodeNames": [
+        "Build test-inbox messages",
+        "One email per applicant",
+        "Send through local Mailpit SMTP",
+        "Mark test delivery complete"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "name": "A - Daily Loan Product Discovery",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "id": "5cfb52b9-efbf-4c74-b44e-6a8681d4fd50",
+      "name": "Daily at 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/discovery/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={}",
+        "options": {
+          "timeout": 120000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "2b2174bc-ae8a-4748-9bbd-bb77347be6e0",
+      "name": "Fetch and validate official lender pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://api:8000/api/products/review-queue",
+        "options": {
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "b4ec5fa4-63e2-4b0b-a7bb-76c7ec4a9122",
+      "name": "Load Gemini criteria proposals for human review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Daily at 07:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch and validate official lender pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch and validate official lender pages": {
+      "main": [
+        [
+          {
+            "node": "Load Gemini criteria proposals for human review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata"
+  },
+  "versionId": "5f95a074-7ddb-4115-90d7-9c6456f93e01",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
