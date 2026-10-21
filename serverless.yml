@@ -1,0 +1,600 @@
+service: loan-eligibility-engine
+frameworkVersion: '3'
+useDotenv: true
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, env:AWS_REGION, 'ap-south-1'}
+  architecture: x86_64
+  httpApi:
+    cors:
+      allowedOrigins:
+        - ${env:APP_ORIGIN}
+      allowedHeaders:
+        - content-type
+        - x-csrf-token
+      allowedMethods:
+        - POST
+        - OPTIONS
+      allowCredentials: true
+    authorizers:
+      firebaseSession:
+        type: request
+        functionName: firebaseSessionAuthorizer
+        payloadVersion: '2.0'
+        enableSimpleResponses: true
+        identitySource:
+          - $request.header.Cookie
+  ecr:
+    scanOnPush: true
+    maxImages: 6
+    images:
+      uploadWorker:
+        path: ./backend
+        file: Dockerfile.lambda
+        buildOptions:
+          - --platform=linux/amd64
+  logs:
+    lambda:
+      retentionInDays: 14
+    httpApi:
+      format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","sourceIp":"$context.identity.sourceIp","requestTime":"$context.requestTime"}'
+custom:
+  uploadBucketName: ${self:service}-${sls:stage}-${aws:accountId}-${aws:region}
+
+functions:
+  firebaseSessionAuthorizer:
+    role:
+      Fn::GetAtt: [FirebaseAuthorizerRole, Arn]
+    image:
+      name: uploadWorker
+      command:
+        - app.aws_ingestion.authorizer_handler
+    timeout: 15
+    environment:
+      FIREBASE_PROJECT_ID: ${env:FIREBASE_PROJECT_ID}
+      FIREBASE_SERVICE_ACCOUNT_SECRET_ARN: ${env:FIREBASE_SERVICE_ACCOUNT_SECRET_ARN}
+
+  presignUpload:
+    role:
+      Fn::GetAtt: [PresignUploadRole, Arn]
+    image:
+      name: uploadWorker
+      command:
+        - app.aws_ingestion.presign_upload_handler
+    timeout: 15
+    memorySize: 512
+    vpc:
+      securityGroupIds:
+        - Ref: LambdaSecurityGroup
+      subnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+    environment:
+      APP_ORIGIN: ${env:APP_ORIGIN}
+      DB_HOST:
+        Fn::GetAtt: [LoanDatabase, Endpoint.Address]
+      DB_PORT: '5432'
+      DB_NAME: ${env:DB_NAME, 'loan_engine'}
+      DB_SECRET_ARN:
+        Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn]
+      DB_SSLMODE: require
+      UPLOAD_BUCKET:
+        Ref: ApplicantUploads
+    events:
+      - httpApi:
+          method: POST
+          path: /uploads/presign
+          authorizer:
+            name: firebaseSession
+
+  ingestS3Upload:
+    role:
+      Fn::GetAtt: [IngestUploadRole, Arn]
+    image:
+      name: uploadWorker
+      command:
+        - app.aws_ingestion.ingest_handler
+    timeout: 120
+    memorySize: 1024
+    reservedConcurrency: 5
+    vpc:
+      securityGroupIds:
+        - Ref: LambdaSecurityGroup
+      subnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+    environment:
+      DB_HOST:
+        Fn::GetAtt: [LoanDatabase, Endpoint.Address]
+      DB_PORT: '5432'
+      DB_NAME: ${env:DB_NAME, 'loan_engine'}
+      DB_SECRET_ARN:
+        Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn]
+      DB_SSLMODE: require
+      UPLOAD_BUCKET:
+        Ref: ApplicantUploads
+      N8N_MATCH_WEBHOOK: ${env:N8N_MATCH_WEBHOOK}
+      N8N_SERVICE_TOKEN_SECRET_ARN: ${env:N8N_SERVICE_TOKEN_SECRET_ARN}
+resources:
+  Resources:
+    LoanVpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.42.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}
+
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+    VpcGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        InternetGatewayId: { Ref: InternetGateway }
+
+    PublicSubnet:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        CidrBlock: 10.42.0.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: ''
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-public-n8n
+
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: { Ref: LoanVpc }
+
+    PublicDefaultRoute:
+      Type: AWS::EC2::Route
+      DependsOn: VpcGatewayAttachment
+      Properties:
+        RouteTableId: { Ref: PublicRouteTable }
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: { Ref: InternetGateway }
+
+    PublicSubnetRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: { Ref: PublicSubnet }
+        RouteTableId: { Ref: PublicRouteTable }
+
+    PrivateSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        CidrBlock: 10.42.1.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: ''
+        MapPublicIpOnLaunch: false
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-private-a
+
+    PrivateSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        CidrBlock: 10.42.2.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: ''
+        MapPublicIpOnLaunch: false
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-private-b
+
+    PrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: { Ref: LoanVpc }
+
+    PrivateSubnetARouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: { Ref: PrivateSubnetA }
+        RouteTableId: { Ref: PrivateRouteTable }
+
+    PrivateSubnetBRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: { Ref: PrivateSubnetB }
+        RouteTableId: { Ref: PrivateRouteTable }
+
+    S3GatewayEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        VpcEndpointType: Gateway
+        ServiceName: com.amazonaws.${self:provider.region}.s3
+        RouteTableIds:
+          - { Ref: PrivateRouteTable }
+
+    SecretsManagerEndpointSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow private Lambda access to Secrets Manager
+        VpcId: { Ref: LoanVpc }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            SourceSecurityGroupId: { Ref: LambdaSecurityGroup }
+
+    SecretsManagerVpcEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: { Ref: LoanVpc }
+        VpcEndpointType: Interface
+        ServiceName: com.amazonaws.${self:provider.region}.secretsmanager
+        PrivateDnsEnabled: true
+        SubnetIds:
+          - { Ref: PrivateSubnetA }
+          - { Ref: PrivateSubnetB }
+        SecurityGroupIds:
+          - { Ref: SecretsManagerEndpointSecurityGroup }
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Loan ingestion Lambda access to PostgreSQL and n8n
+        VpcId: { Ref: LoanVpc }
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Private PostgreSQL access from loan ingestion Lambdas
+        VpcId: { Ref: LoanVpc }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: { Ref: LambdaSecurityGroup }
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: { Ref: N8nWorkflowSecurityGroup }
+
+    N8nWorkflowSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Attach to the Docker host running API and n8n
+        VpcId: { Ref: LoanVpc }
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 5678
+            ToPort: 5678
+            SourceSecurityGroupId: { Ref: LambdaSecurityGroup }
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    DatabaseSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Private subnets for the loan engine database
+        SubnetIds:
+          - { Ref: PrivateSubnetA }
+          - { Ref: PrivateSubnetB }
+
+    FirebaseAuthorizerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: ReadFirebaseSessionVerifier
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: ${env:FIREBASE_SERVICE_ACCOUNT_SECRET_ARN}
+
+    PresignUploadRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        Policies:
+          - PolicyName: PrepareApplicantUpload
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn]
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucketName}/incoming/*
+
+    IngestUploadRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        Policies:
+          - PolicyName: IngestApplicantUpload
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn]
+                    - ${env:N8N_SERVICE_TOKEN_SECRET_ARN}
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:DeleteObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucketName}/incoming/*
+
+    LoanDatabase:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      Properties:
+        Engine: postgres
+        DBInstanceClass: db.t4g.micro
+        AllocatedStorage: '20'
+        MaxAllocatedStorage: 100
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: ${env:DB_NAME, 'loan_engine'}
+        MasterUsername: ${env:DB_MASTER_USERNAME, 'loan_engine'}
+        ManageMasterUserPassword: true
+        DBSubnetGroupName: { Ref: DatabaseSubnetGroup }
+        VPCSecurityGroups:
+          - { Ref: DatabaseSecurityGroup }
+        PubliclyAccessible: false
+        MultiAZ: false
+        BackupRetentionPeriod: 7
+        AutoMinorVersionUpgrade: true
+
+    ApplicantUploads:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.uploadBucketName}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - ${env:APP_ORIGIN}
+              AllowedMethods:
+                - POST
+              AllowedHeaders:
+                - content-type
+              ExposedHeaders:
+                - ETag
+              MaxAge: 3000
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpireIncomingApplicantCsv
+              Status: Enabled
+              Prefix: incoming/
+              ExpirationInDays: 7
+        NotificationConfiguration:
+          EventBridgeConfiguration: {}
+
+    UploadIngestionDlq:
+      Type: AWS::SQS::Queue
+      Properties:
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    UploadIngestionDlqPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - { Ref: UploadIngestionDlq }
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [UploadIngestionDlq, Arn] }
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: { Fn::GetAtt: [S3ObjectCreatedRule, Arn] }
+
+    S3ObjectCreatedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Description: Start ingestion only for direct-to-S3 CSV uploads
+        EventPattern:
+          source:
+            - aws.s3
+          detail-type:
+            - Object Created
+          detail:
+            bucket:
+              name:
+                - { Ref: ApplicantUploads }
+            object:
+              key:
+                - prefix: incoming/
+        State: ENABLED
+        Targets:
+          - Id: IngestCsvObject
+            Arn: { Fn::GetAtt: [IngestS3UploadLambdaFunction, Arn] }
+            DeadLetterConfig:
+              Arn: { Fn::GetAtt: [UploadIngestionDlq, Arn] }
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 3600
+              MaximumRetryAttempts: 5
+
+    S3ObjectCreatedInvokePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: { Fn::GetAtt: [IngestS3UploadLambdaFunction, Arn] }
+        Action: lambda:InvokeFunction
+        Principal: events.amazonaws.com
+        SourceArn: { Fn::GetAtt: [S3ObjectCreatedRule, Arn] }
+
+    UploadIngestionDlqAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmDescription: One or more S3 upload events exhausted retries and need replay
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: { Fn::GetAtt: [UploadIngestionDlq, QueueName] }
+
+    SesSenderIdentity:
+      Type: AWS::SES::EmailIdentity
+      Properties:
+        EmailIdentity: ${env:SES_FROM_EMAIL}
+
+    N8nSesRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-n8n-ses
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: ec2.amazonaws.com
+              Action: sts:AssumeRole
+            - Effect: Allow
+              Principal:
+                AWS: arn:${aws:partition}:iam::${aws:accountId}:root
+              Action: sts:AssumeRole
+              Condition:
+                StringEquals:
+                  aws:PrincipalArn: arn:${aws:partition}:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
+                  sts:ExternalId: loan-engine-${sls:stage}-${aws:accountId}
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        Policies:
+          - PolicyName: SendLoanEngineTestNotifications
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ses:SendEmail
+                    - ses:SendRawEmail
+                  Resource:
+                    - arn:aws:ses:${aws:region}:${aws:accountId}:identity/${env:SES_FROM_EMAIL}
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: arn:${aws:partition}:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
+        Tags:
+          - Key: Name
+            Value: ${self:service}-${sls:stage}-n8n-ses-role
+
+    N8nInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Roles:
+          - { Ref: N8nSesRole }
+
+    UploadApiDomain:
+      Type: AWS::ApiGatewayV2::DomainName
+      Properties:
+        DomainName: ${env:UPLOAD_API_DOMAIN}
+        DomainNameConfigurations:
+          - CertificateArn: ${env:UPLOAD_API_CERTIFICATE_ARN}
+            EndpointType: REGIONAL
+            SecurityPolicy: TLS_1_2
+
+    UploadApiMapping:
+      Type: AWS::ApiGatewayV2::ApiMapping
+      DependsOn:
+        - HttpApiStage
+      Properties:
+        ApiId: { Ref: HttpApi }
+        DomainName: { Ref: UploadApiDomain }
+        Stage: '$default'
+
+  Outputs:
+    UploadBucketName:
+      Value: { Ref: ApplicantUploads }
+    DatabaseSecretArn:
+      Value: { Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn] }
+    DatabaseHost:
+      Value: { Fn::GetAtt: [LoanDatabase, Endpoint.Address] }
+    UploadApiUrl:
+      Value: https://${env:UPLOAD_API_DOMAIN}/uploads/presign
+    UploadApiRegionalDomain:
+      Value: { Fn::GetAtt: [UploadApiDomain, RegionalDomainName] }
+    UploadApiRegionalHostedZoneId:
+      Value: { Fn::GetAtt: [UploadApiDomain, RegionalHostedZoneId] }
+    N8nWorkflowSecurityGroupId:
+      Value: { Ref: N8nWorkflowSecurityGroup }
+    VpcId:
+      Value: { Ref: LoanVpc }
+    PublicSubnetId:
+      Value: { Ref: PublicSubnet }
+    N8nInstanceProfileArn:
+      Value: { Fn::GetAtt: [N8nInstanceProfile, Arn] }
+    N8nSesRoleArn:
+      Value: { Fn::GetAtt: [N8nSesRole, Arn] }
+    N8nSystemCredentialsExternalId:
+      Value: loan-engine-${sls:stage}-${aws:accountId}
+    UploadIngestionDlqUrl:
+      Value: { Ref: UploadIngestionDlq }

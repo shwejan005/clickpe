@@ -170,8 +170,8 @@ This section records implementation and local runtime evidence collected on 19 O
 | Notification workflow and local delivery | Runtime verified end to end | The earlier 10,000-row notification execution `8` eventually completed, and database status later showed all 6,778 match rows sent to the controlled local test inbox. Synthetic batch `ed9bc194-649e-4a32-aeaa-896ccfc87267` exercised current Workflow B execution `12` and bounded Workflow C executions `13` and `14`: 12 applicant emails were delivered to the configured Mailpit test recipient, all 24 associated match rows transitioned to `sent_to_local_test_inbox`, and none remained pending. Applicant CSV email addresses are not used as destinations. |
 | Scale-safe notification batching and duplicate-send controls | Implemented; multi-page runtime verified | `backend/app/main.py` claims applicant notifications with a lease, bounded page size (default 10, maximum 25), a per-batch cap (default 25), and claim IDs. Workflow C retries SMTP up to three times, acknowledges completion by claim ID, and recursively starts another page only when work remains. The 12-recipient run required two API page fetches (10 then 2) and completed 12 messages / 24 match rows. SMTP acceptance followed by a lost acknowledgement can still lead to a resend after the 15-minute lease expires; exactly-once SMTP delivery cannot be guaranteed. |
 | Workflow evaluation suite | Implemented; 10 checks pass | `backend/evals/test_workflow_evals.py` covers mocked Gemini evidence/source validation and PII boundaries, deterministic matching rules and invalid inputs, controlled-recipient email construction, and workflow-export topology. Run with `python -m pytest evals -q` from `backend`; the local run passed 10 tests. These are focused evaluations, not exhaustive production acceptance tests. |
-| Managed schema migrations and production operations | Not implemented | Local database backfills/index setup run at API startup. Production rollout still needs versioned migrations, observability, backup/restore procedure, secrets management, and load tests. |
-| AWS deployment checklist | Plan only | No AWS resources or deployment templates are present in the workspace evidence reviewed. S3, presigned upload, Lambda, private RDS/VPC, EC2 n8n, IAM/Secrets Manager, SES, and CloudWatch remain later work. |
+| Managed schema migrations and production operations | Versioned migrations implemented; operations still pending | API startup runs Alembic revisions for fresh databases and upgrades the previous local schema with data-preserving backfills. Production rollout still needs observability, backup/restore procedure, and load measurements. |
+| AWS deployment files | Implemented in repository; not deployed | `serverless.yml` defines the S3, API Gateway, Lambda, private RDS/VPC, IAM/Secrets Manager, SES, and CloudWatch stack. `docker-compose.aws.yml` and `Caddyfile` describe the n8n/API/frontend EC2 host. Account values, DNS, SES, EC2 launch, live upload, and cost cleanup remain user-side deployment steps. |
 
 #### Evidence and audit interpretation
 
@@ -190,10 +190,11 @@ This section records implementation and local runtime evidence collected on 19 O
 #### Remaining action items
 
 1. A human should review the pending ICICI proposal in the React **Criteria review** panel. Confirm the quoted official-source evidence and applicable rates, then approve/reject with the review token; until then ICICI stays out of matching.
-2. Add Alembic or equivalent versioned migrations. Current compatibility migrations execute during API startup, which is useful locally but does not provide controlled production rollout/rollback.
-3. Add fault-injection acceptance coverage for interrupted chunked matching, repeated webhook delivery, stale notification lease recovery, SMTP failure/ambiguous acceptance, no-match batches, stale products, malformed uploads, and changed-source Gemini cache invalidation.
-4. Measure SQL plans and timings at larger applicant/product counts; the 10k local fixture is a baseline only. Add indexes or partitioning only in response to query-plan and load evidence.
-5. Add operational monitoring, backups/restore drills, retention policies, and AWS infrastructure only when moving beyond the local-first phase. AWS resources remain plan-only.
+2. Add fault-injection acceptance coverage for interrupted chunked matching, repeated webhook delivery, stale notification lease recovery, SMTP/SES failure and ambiguous acceptance, no-match batches, stale products, malformed uploads, and changed-source Gemini cache invalidation.
+3. Measure SQL plans and timings at larger applicant/product counts; the 10k local fixture is a baseline only. Add indexes or partitioning only in response to query-plan and load evidence.
+4. Add operational monitoring dashboards and backup/restore drills. The AWS stack includes Lambda log retention and an ingestion DLQ alarm; it does not provide a complete production on-call or restore process.
+5. Complete the AWS account setup documented in `README.md`, deploy a small demo stack, prove an SES test-inbox notification, and remove the resources after the demonstration.
+6. Record and host the 5–10 minute walkthrough, invite the requested GitHub collaborators to the private repository, and submit both links through the assignment form. These actions require account access and have not been performed from the workspace.
 
 ## Phase 4 — Notifications (n8n Workflow C)
 
@@ -205,7 +206,7 @@ Run the full flow locally: start Docker Compose, upload `users.csv`, verify inge
 
 Deliver the Compose configuration, application source, database migrations, exported n8n workflow JSON files, `.env.example`, and a README with local setup, workflow import, credentials, troubleshooting, and an architecture diagram. Record the requested 5–10 minute walkthrough with node-by-node explanations and the complete upload-to-email demo. Submit repository and video links through the assignment form within 72 hours of receiving the assignment email.
 
-## AWS Setup Checklist — Later Deployment
+## AWS Setup Checklist — Implemented Deployment Path
 
 Keep resources in one AWS Region, selected near intended users and with the needed services available.
 
@@ -218,26 +219,25 @@ Keep resources in one AWS Region, selected near intended users and with the need
 
 ### 2. VPC and network access
 
-- Create a VPC with public subnets for the n8n host and private subnets in at least two Availability Zones for the RDS subnet group.
-- Run n8n on a small EC2 instance using the assignment's Docker Compose setup. Attach an instance role and administer it with Systems Manager Session Manager instead of exposing SSH.
+- `serverless.yml` creates one public subnet for the n8n/API host and private subnets in two Availability Zones for the RDS subnet group.
+- Run n8n and the API on an EC2 instance using `docker-compose.aws.yml`. Attach the provided instance profile and administer it with Systems Manager Session Manager instead of exposing SSH.
 - Give n8n a stable HTTPS webhook URL. Use a domain and TLS reverse proxy or HTTPS load balancer; restrict inbound traffic to HTTPS and protect the n8n editor with authentication.
 - Keep RDS private. Allow PostgreSQL TCP 5432 only from the n8n host and ingestion Lambda security groups.
-- Place the ingestion Lambda in the VPC to reach RDS. A VPC-attached Lambda does not get internet access just by using a public subnet; avoid NAT unless a function truly needs outbound internet. In this design, crawling and LLM calls run from the n8n host.
+- The ingestion and presign Lambdas run in the VPC to reach RDS. S3 and Secrets Manager VPC endpoints provide required service access without a NAT Gateway. The Firebase session authorizer stays outside the VPC; crawling and optional LLM calls run from the n8n host.
 
 ### 3. Storage and CSV event ingestion
 
-- Create a private S3 bucket for CSV uploads. Keep Block Public Access enabled, enable default encryption, and configure CORS only for the upload origin if the browser uploads directly.
-- Use API Gateway or a Lambda Function URL to issue short-lived presigned upload URLs. Upload CSV bytes directly to S3 rather than through API Gateway/Lambda.
-- Configure an S3 object-created event on the incoming CSV prefix to invoke the ingestion Lambda. Grant S3 permission to invoke it and avoid triggering on output prefixes.
-- The Lambda reads and validates each object, writes rows and batch status to RDS, then invokes the n8n matching webhook. Make ingestion idempotent because event delivery/retries can repeat work.
-- Add an S3 lifecycle rule to delete uploaded CSVs after the chosen retention period.
+- The template creates a private S3 bucket with Block Public Access, SSE-S3 encryption, browser CORS for the configured origin, and a seven-day incoming-object lifecycle rule.
+- API Gateway's `POST /uploads/presign` route validates the Firebase session, CSRF token, workspace membership, filename, and reported size before issuing a 10-minute S3 presigned POST policy with a 25 MB content-length limit. The AWS UI disables its direct API-body upload route.
+- EventBridge invokes the ingestion Lambda for objects under `incoming/`, with five retries, an SQS dead-letter queue, and a CloudWatch alarm.
+- The Lambda rechecks actual size, validates rows using the shared Python validator, writes batches/applicants atomically to RDS in chunks, and invokes the n8n matching webhook only after commit. Workspace-scoped content hashes make repeated S3 events safe.
 
 ### 4. Database, secrets, and permissions
 
-- Create RDS for PostgreSQL in private subnets, with encryption and automated backups; disable public access.
-- Store database credentials and the LLM API key in AWS Secrets Manager or an approved secret store. Let n8n and Lambda retrieve only the secrets they need; do not put secrets in Git, workflow exports, or plain-text deployment files.
-- Use separate least-privilege IAM roles for deployment, ingestion Lambda, and n8n EC2. Limit S3 access to the upload bucket/prefix and SES access to the verified sender identity.
-- Apply database migrations during deployment rather than relying on manual schema edits.
+- The template creates encrypted, private RDS PostgreSQL with a managed master secret and seven-day backups. Database access is limited to the Lambda and EC2 security groups.
+- Firebase Admin JSON and the n8n service token are supplied as Secrets Manager ARNs. Lambda functions use separate roles: the authorizer reads only the Firebase secret, presign reads DB credentials and can sign incoming S3 writes, and ingestion reads DB/token secrets and reads/deletes incoming objects.
+- The EC2 instance profile allows SSM administration and SES sends from the configured identity. n8n uses its system identity through an AWS Assume Role credential; no long-lived AWS keys are stored in workflow exports.
+- Alembic migrations run when the API starts, before it serves routes. n8n workflows call the API for data operations; the API owns its PostgreSQL connection.
 
 ### 5. Email, logs, and operational checks
 
@@ -246,17 +246,17 @@ Keep resources in one AWS Region, selected near intended users and with the need
 - Use CloudWatch Logs for Lambda errors and execution details with a sensible retention period. Check Lambda errors/throttles, S3 event delivery, database connectivity, n8n execution failures, and SES send failures during the end-to-end test.
 - Check budget alerts and service charges, then remove AWS resources no longer needed.
 
-### Planned AWS resources
+### AWS resources in `serverless.yml`
 
-**Required for the AWS version:** S3, upload URL endpoint, ingestion Lambda, S3 event notification/permission, VPC/subnets/security groups, private RDS PostgreSQL, EC2 for Dockerized n8n, IAM roles, Secrets Manager, SES, and CloudWatch Logs.
+**Provisioned by the template:** S3, API Gateway presign route, Lambda authorizer/presigner/ingester, EventBridge, SQS DLQ/alarm, VPC/subnets/security groups/endpoints, private RDS PostgreSQL, IAM roles/profile, managed DB secret, and SES sender identity. The n8n/API/frontend EC2 host and DNS records are created by the operator.
 
-**Optional or conditional:** Route 53 domain and ACM certificate (depending on HTTPS hosting); NAT Gateway (only if a private resource needs general internet access); SQS/DLQ for buffering and replay if direct event-to-Lambda retries prove insufficient; API Gateway (a Lambda Function URL can handle the small presign request); AWS deployment itself (local deployment is accepted).
+**Operator setup:** DNS names, same-region ACM certificate for API Gateway, stable EC2 public address, Firebase/notification values, and SES sender/test-recipient verification. This demo design avoids a NAT Gateway and public RDS.
 
 ## Architecture
 
-**Local:** Browser -> Python upload service -> local file storage -> PostgreSQL -> n8n Workflow B -> PostgreSQL matches -> n8n Workflow C -> test inbox. Workflow A runs on a schedule and updates PostgreSQL.
+**Local:** Browser -> Python upload service -> local file storage -> API -> PostgreSQL. n8n Workflow A runs on a schedule; Workflow B calls the API for SQL matching; Workflow C calls the API for test-recipient messages and sends to Mailpit.
 
-**AWS:** Browser -> presigned S3 upload -> S3 event -> ingestion Lambda -> private RDS -> n8n webhook/workflows -> RDS matches -> SES test email. n8n runs in Docker Compose on EC2 and reaches RDS over the VPC.
+**AWS:** Browser -> API Gateway presign route -> S3 POST -> EventBridge -> ingestion Lambda -> private RDS. The Lambda triggers Workflow B through n8n; n8n and Workflow A call the EC2-hosted API, which owns the RDS connection. Workflow C sends through SES to the controlled test inbox.
 
 ## AWS references
 

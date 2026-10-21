@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Activity, ArrowLeft, ArrowRight, Bell, Boxes, Check, CheckCircle2, Clock3, Database, Eye, FileSpreadsheet, FileText, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, PackageSearch, Pencil, RefreshCw, Search, Shield, ShieldCheck, Upload, Users, Workflow, X } from "lucide-react";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
-import { apiJson } from "./lib/api";
+import { API_BASE, apiJson } from "./lib/api";
 import { AlertBox, Badge, Button, Card, CardContent, CardHeader, ConfirmDialog, EmptyState, Input, LoadingBlock, PageTitle, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui";
 
 type RunSummary = {
@@ -28,13 +28,14 @@ const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 10
 function date(value?: string | null) { return value ? new Date(value).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "—"; }
 function count(value?: number) { return (value || 0).toLocaleString("en-IN"); }
 function statusTone(status?: string): "neutral" | "success" | "warning" | "danger" | "info" {
-  if (["completed", "verified", "sent_to_local_test_inbox", "delivered", "approved"].includes(status || "")) return "success";
+  if (["completed", "verified", "sent_to_test_inbox", "sent_to_local_test_inbox", "delivered", "approved"].includes(status || "")) return "success";
   if (["running", "queued", "sending"].includes(status || "")) return "info";
   if (["failed", "error", "stale", "rejected"].includes(status || "")) return status === "stale" ? "warning" : "danger";
   if (["needs_information", "pending", "pending_human_review", "completed_with_errors"].includes(status || "")) return "warning";
   return "neutral";
 }
-function stateLabel(status?: string) { return (status || "unknown").replaceAll("sent_to_local_test_inbox", "test inbox delivery").replaceAll("_", " "); }
+function stateLabel(status?: string) { return (status || "unknown").replaceAll("sent_to_local_test_inbox", "test inbox delivery").replaceAll("sent_to_test_inbox", "test inbox delivery").replaceAll("_", " "); }
+function sentNotifications(counts?: Record<string, number>) { return (counts?.sent_to_test_inbox || 0) + (counts?.sent_to_local_test_inbox || 0); }
 
 function App() {
   return <QueryClientProvider client={queryClient}><TooltipProvider delayDuration={150}><AuthProvider><BrowserRouter><Routes>
@@ -174,28 +175,30 @@ function RunsPage() {
 
 function RunsTable({ items, compact = false }: { items: RunSummary[]; compact?: boolean }) {
   if (!items.length) return <EmptyState icon={<FileText size={20} />} title="No runs yet" description="Upload a CSV to begin. Each batch will appear here with matching and notification history." action={<Link to="/uploads/new"><Button size="sm">Start an upload</Button></Link>} />;
-  return <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left"><thead><tr className="border-b border-slate-100 bg-slate-50/80 text-[10px] font-bold uppercase tracking-wider text-slate-400"><th className="px-4 py-3">Upload</th><th className="px-4 py-3">Imported</th><th className="px-4 py-3">Matches</th><th className="px-4 py-3">Notifications</th><th className="px-4 py-3">Run state</th><th className="px-4 py-3">Created</th><th /></tr></thead><tbody>{items.map((run) => <tr key={run.batch_id} className="table-row border-b border-slate-50 last:border-0"><td className="px-4 py-3"><Link to={`/runs/${run.batch_id}`} className="block max-w-[240px] truncate text-xs font-semibold text-navy-950 hover:text-blue-700">{run.file_name}</Link><span className="mt-1 block font-mono text-[9px] text-slate-400">{run.batch_id.slice(0, 13)}…</span></td><td className="px-4 py-3"><div className="text-xs font-semibold text-slate-700">{count(run.rows_imported)}</div><div className="text-[10px] text-slate-400">{count(run.rows_rejected)} rejected</div></td><td className="px-4 py-3"><div className="text-xs font-semibold text-slate-700">{count(sum(run.match_counts))}</div><div className="text-[10px] text-slate-400">{count(run.match_counts?.needs_information)} need info</div></td><td className="px-4 py-3"><span className="text-xs font-semibold text-slate-700">{count(run.notification_counts?.sent_to_local_test_inbox)} sent</span><div className="text-[10px] text-slate-400">{count(run.notification_counts?.pending)} pending</div></td><td className="px-4 py-3"><Badge tone={statusTone(run.match_job?.status || run.status)}>{stateLabel(run.match_job?.status || run.status)}</Badge></td><td className="px-4 py-3 text-[10px] text-slate-500">{date(run.created_at)}</td><td className="px-4 py-3"><Link className="grid size-8 place-items-center rounded-lg text-slate-400 hover:bg-blue-50 hover:text-blue-700" to={`/runs/${run.batch_id}`} title="View run"><ArrowRight size={15} /></Link></td></tr>)}</tbody></table></div>{compact && <div className="border-t border-slate-100 px-4 py-3 text-right"><Link className="text-xs font-semibold text-blue-700" to="/runs">View complete history <ArrowRight className="ml-1 inline" size={13} /></Link></div>}</div>;
+  return <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left"><thead><tr className="border-b border-slate-100 bg-slate-50/80 text-[10px] font-bold uppercase tracking-wider text-slate-400"><th className="px-4 py-3">Upload</th><th className="px-4 py-3">Imported</th><th className="px-4 py-3">Matches</th><th className="px-4 py-3">Notifications</th><th className="px-4 py-3">Run state</th><th className="px-4 py-3">Created</th><th /></tr></thead><tbody>{items.map((run) => <tr key={run.batch_id} className="table-row border-b border-slate-50 last:border-0"><td className="px-4 py-3"><Link to={`/runs/${run.batch_id}`} className="block max-w-[240px] truncate text-xs font-semibold text-navy-950 hover:text-blue-700">{run.file_name}</Link><span className="mt-1 block font-mono text-[9px] text-slate-400">{run.batch_id.slice(0, 13)}…</span></td><td className="px-4 py-3"><div className="text-xs font-semibold text-slate-700">{count(run.rows_imported)}</div><div className="text-[10px] text-slate-400">{count(run.rows_rejected)} rejected</div></td><td className="px-4 py-3"><div className="text-xs font-semibold text-slate-700">{count(sum(run.match_counts))}</div><div className="text-[10px] text-slate-400">{count(run.match_counts?.needs_information)} need info</div></td><td className="px-4 py-3"><span className="text-xs font-semibold text-slate-700">{count(sentNotifications(run.notification_counts))} sent</span><div className="text-[10px] text-slate-400">{count(run.notification_counts?.pending)} pending</div></td><td className="px-4 py-3"><Badge tone={statusTone(run.match_job?.status || run.status)}>{stateLabel(run.match_job?.status || run.status)}</Badge></td><td className="px-4 py-3 text-[10px] text-slate-500">{date(run.created_at)}</td><td className="px-4 py-3"><Link className="grid size-8 place-items-center rounded-lg text-slate-400 hover:bg-blue-50 hover:text-blue-700" to={`/runs/${run.batch_id}`} title="View run"><ArrowRight size={15} /></Link></td></tr>)}</tbody></table></div>{compact && <div className="border-t border-slate-100 px-4 py-3 text-right"><Link className="text-xs font-semibold text-blue-700" to="/runs">View complete history <ArrowRight className="ml-1 inline" size={13} /></Link></div>}</div>;
 }
 function sum(counts?: Record<string, number>) { return Object.values(counts || {}).reduce((total, value) => total + value, 0); }
 
 function UploadPage() {
+  const { profile } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
   const navigate = useNavigate();
   const client = useQueryClient();
-  const mutation = useMutation({ mutationFn: (selected: File) => uploadFile(selected, setProgress), onSuccess: (result: RunSummary & { duplicate_upload: boolean }) => {
+  const s3Upload = import.meta.env.VITE_UPLOAD_MODE === "s3";
+  const mutation = useMutation({ mutationFn: (selected: File) => uploadFile(selected, profile?.workspace?.id || "", setProgress), onSuccess: (result: RunSummary & { duplicate_upload: boolean }) => {
     client.invalidateQueries({ queryKey: ["dashboard"] }); client.invalidateQueries({ queryKey: ["runs"] }); navigate(`/runs/${result.batch_id}`);
   }, onError: (e) => setError(e instanceof Error ? e.message : "Upload failed") });
-  function pick(next: File | null) { setError(""); if (!next) return; if (!next.name.toLowerCase().endsWith(".csv")) { setError("Choose a .csv file."); return; } if (next.size > 25 * 1024 * 1024) { setError("This file exceeds the 25 MB upload limit."); return; } setFile(next); }
-  return <><PageTitle eyebrow="NEW DATA BATCH" title="Upload applicants" description="Upload a CSV to validate applicants and automatically start the SQL matching workflow." actions={<Link to="/runs"><Button variant="outline"><ArrowLeft size={14} /> Run history</Button></Link>} />
+  function pick(next: File | null) { setError(""); if (!next) return; if (!next.name.toLowerCase().endsWith(".csv")) { setError("Choose a .csv file."); return; } if (next.size === 0) { setError("The CSV file is empty."); return; } if (next.size > 25 * 1024 * 1024) { setError("This file exceeds the 25 MB upload limit."); return; } setFile(next); }
+  return <><PageTitle eyebrow="NEW DATA BATCH" title="Upload applicants" description={s3Upload ? "Upload directly to encrypted S3 storage; an object event validates and imports rows before matching starts." : "Upload a CSV to validate applicants and automatically start the SQL matching workflow."} actions={<Link to="/runs"><Button variant="outline"><ArrowLeft size={14} /> Run history</Button></Link>} />
     <div className="mx-auto grid max-w-5xl gap-5 xl:grid-cols-[1fr_300px]"><Card><CardContent className="p-6 sm:p-8"><div onDragEnter={(e) => { e.preventDefault(); setDragging(true); }} onDragOver={(e) => e.preventDefault()} onDragLeave={() => setDragging(false)} onDrop={(e) => { e.preventDefault(); setDragging(false); pick(e.dataTransfer.files?.[0] || null); }} className={`upload-dropzone ${dragging ? "upload-dropzone-active" : ""}`} onClick={() => document.getElementById("csv-upload")?.click()} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") document.getElementById("csv-upload")?.click(); }}>
         <input id="csv-upload" className="hidden" type="file" accept=".csv,text/csv" onChange={(e) => pick(e.target.files?.[0] || null)} />{file ? <><div className="grid size-14 place-items-center rounded-2xl bg-emerald-50 text-emerald-600"><FileSpreadsheet size={25} /></div><div className="mt-4 max-w-full truncate font-semibold text-navy-950">{file.name}</div><div className="mt-1 text-xs text-slate-400">{(file.size / 1024).toFixed(0)} KB · Ready to upload</div></> : <><div className="grid size-14 place-items-center rounded-2xl bg-blue-50 text-blue-600"><Upload size={24} /></div><div className="mt-4 font-semibold text-navy-950">Drop your CSV here or browse</div><div className="mt-1 text-xs text-slate-400">Maximum file size 25 MB</div></>}
       </div>
       {file && <button className="mt-3 text-xs font-semibold text-blue-700 hover:underline" onClick={() => setFile(null)}>Choose a different file</button>}
       <div className="mt-6 rounded-xl border border-slate-100 bg-slate-50 p-4"><div className="flex items-center gap-2 text-xs font-semibold text-slate-700"><FileText size={15} className="text-blue-600" /> Required CSV columns</div><p className="mt-2 break-words font-mono text-[10px] leading-5 text-slate-500">user_id, name, email, monthly_income, credit_score, employment_status, age</p></div>
-      {error && <AlertBox className="mt-4">{error}</AlertBox>}{mutation.isPending && <div className="mt-4"><div className="flex justify-between text-xs text-slate-500"><span>Uploading and saving rows</span><span>{progress}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-blue-600 transition-[width] duration-200" style={{ width: `${progress}%` }} /></div><p className="mt-2 text-[10px] text-slate-400">Matching starts after the upload is committed. Follow the live run on its detail page.</p></div>}
+      {error && <AlertBox className="mt-4">{error}</AlertBox>}{mutation.isPending && <div className="mt-4"><div className="flex justify-between text-xs text-slate-500"><span>{s3Upload && progress >= 90 ? "Waiting for S3 ingestion" : "Uploading and saving rows"}</span><span>{progress}%</span></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-blue-600 transition-[width] duration-200" style={{ width: `${progress}%` }} /></div><p className="mt-2 text-[10px] text-slate-400">Matching starts after the upload is committed. Follow the live run on its detail page.</p></div>}
       <Button size="lg" className="mt-5 w-full" disabled={!file || mutation.isPending} onClick={() => { setProgress(0); setError(""); if (file) mutation.mutate(file); }}>{mutation.isPending ? <><LoaderCircle size={16} className="animate-spin" /> Uploading…</> : <>Upload and start matching <ArrowRight size={16} /></>}</Button>
     </CardContent></Card>
       <Card><CardHeader><div><p className="section-kicker">BEFORE YOU START</p><h2 className="card-title">What happens next</h2></div></CardHeader><CardContent className="space-y-4">{[{icon:<CheckCircle2 size={16}/>,title:"Validate & save",desc:"Accepted rows are stored with a batch record; rejected rows are summarized."},{icon:<Workflow size={16}/>,title:"Match with SQL",desc:"Fresh verified criteria are checked by the database. No applicant data is sent to Gemini."},{icon:<Bell size={16}/>,title:"Test notification",desc:"Email is routed to the controlled test inbox, never the CSV address."}].map((step)=><div className="flex gap-3" key={step.title}><span className="mt-0.5 text-blue-600">{step.icon}</span><div><div className="text-xs font-semibold text-navy-950">{step.title}</div><p className="mt-1 text-[10px] leading-4 text-slate-500">{step.desc}</p></div></div>)}</CardContent></Card>
@@ -203,11 +206,15 @@ function UploadPage() {
   </>;
 }
 
-async function uploadFile(file: File, onProgress: (value: number) => void): Promise<RunSummary & { duplicate_upload: boolean }> {
+async function uploadFile(file: File, workspaceId: string, onProgress: (value: number) => void): Promise<RunSummary & { duplicate_upload: boolean }> {
+  if (import.meta.env.VITE_UPLOAD_MODE === "s3") {
+    return uploadFileToS3(file, workspaceId, onProgress);
+  }
   const csrf = document.cookie.split("; ").find((item) => item.trim().startsWith("clickpe_csrf="))?.split("=")[1];
   const form = new FormData(); form.append("file", file);
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest(); xhr.open("POST", `${import.meta.env.VITE_API_URL || "http://localhost:8000"}/api/uploads`); xhr.withCredentials = true;
+    const xhr = new XMLHttpRequest(); xhr.open("POST", `${API_BASE}/api/uploads`); xhr.withCredentials = true;
+    if (workspaceId) xhr.setRequestHeader("X-Workspace-ID", workspaceId);
     if (csrf) xhr.setRequestHeader("X-CSRF-Token", decodeURIComponent(csrf));
     xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100)); };
     xhr.onload = () => { const payload = JSON.parse(xhr.responseText || "{}"); if (xhr.status >= 200 && xhr.status < 300) resolve(payload); else reject(new Error(payload.detail || `Upload failed (${xhr.status})`)); };
@@ -215,9 +222,67 @@ async function uploadFile(file: File, onProgress: (value: number) => void): Prom
   });
 }
 
+async function uploadFileToS3(file: File, workspaceId: string, onProgress: (value: number) => void): Promise<RunSummary & { duplicate_upload: boolean }> {
+  const endpoint = import.meta.env.VITE_UPLOAD_PRESIGN_URL;
+  if (!endpoint) throw new Error("VITE_UPLOAD_PRESIGN_URL is required when S3 uploads are enabled.");
+  if (!workspaceId) throw new Error("Select a workspace before uploading.");
+  const csrf = document.cookie.split("; ").find((item) => item.trim().startsWith("clickpe_csrf="))?.split("=")[1];
+  if (!csrf) throw new Error("Your secure session is missing. Refresh the page and sign in again.");
+
+  const presignResponse = await fetch(endpoint, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": decodeURIComponent(csrf) },
+    body: JSON.stringify({ workspace_id: workspaceId, file_name: file.name, content_length: file.size }),
+  });
+  const presign = await presignResponse.json().catch(() => ({}));
+  if (!presignResponse.ok) throw new Error(presign.detail || `Could not prepare the upload (${presignResponse.status}).`);
+
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    Object.entries(presign.upload_fields || {}).forEach(([key, value]) => form.append(key, String(value)));
+    form.append("file", file, file.name);
+    xhr.open(presign.upload_method || "POST", presign.upload_url);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(Math.min(85, Math.round(event.loaded / event.total * 85)));
+    };
+    xhr.onload = () => xhr.status >= 200 && xhr.status < 300
+      ? resolve()
+      : reject(new Error(`S3 rejected the upload (${xhr.status}). Check the bucket CORS and presigned URL settings.`));
+    xhr.onerror = () => reject(new Error("Could not reach S3. Check the upload URL and bucket CORS settings."));
+    xhr.send(form);
+  });
+
+  onProgress(90);
+  const digestBytes = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  const digest = Array.from(new Uint8Array(digestBytes), (value) => value.toString(16).padStart(2, "0")).join("");
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    try {
+      const batch = await apiJson<RunSummary & { duplicate_upload: boolean }>(`/api/uploads/by-content/${digest}`);
+      onProgress(100);
+      return batch;
+    } catch (error) {
+      const status = (error as Error & { status?: number }).status;
+      if (status !== 404 && status !== 503) throw error;
+      onProgress(Math.min(98, 90 + Math.floor(attempt / 10)));
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+  }
+  throw new Error(`The S3 file was accepted, but ingestion has not appeared yet. Upload ID: ${presign.upload_id}`);
+}
+
 function RunDetailPage() {
   const { batchId = "" } = useParams();
-  const query = useQuery({ queryKey: ["run", batchId], queryFn: () => apiJson<RunDetail>(`/api/runs/${encodeURIComponent(batchId)}`), refetchInterval: (q) => ["running", "queued"].includes(q.state.data?.match_job?.status || "") ? 1500 : false });
+  const query = useQuery({ queryKey: ["run", batchId], queryFn: () => apiJson<RunDetail>(`/api/runs/${encodeURIComponent(batchId)}`), refetchInterval: (q) => {
+    const run = q.state.data;
+    const jobActive = ["running", "queued"].includes(run?.match_job?.status || "");
+    const s3DispatchPending = import.meta.env.VITE_UPLOAD_MODE === "s3"
+      && Boolean(run?.rows_imported)
+      && !run?.match_job
+      && Date.now() - Date.parse(run.created_at) < 120_000;
+    return jobActive || s3DispatchPending ? 1500 : false;
+  } });
   const client = useQueryClient();
   const notify = useMutation({ mutationFn: () => apiJson("/api/workflows/notifications/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ batch_id: batchId }) }), onSuccess: () => { client.invalidateQueries({ queryKey: ["run", batchId] }); } });
   const run = query.data;
@@ -225,7 +290,7 @@ function RunDetailPage() {
   if (query.error || !run) return <PageError error={query.error || new Error("Run not found")} retry={() => void query.refetch()} />;
   const job = run.match_job;
   const isActive = ["running", "queued"].includes(job?.status || "");
-  const sent = run.notification_counts?.sent_to_local_test_inbox || 0;
+  const sent = sentNotifications(run.notification_counts);
   const pending = run.notification_counts?.pending || 0;
   return <><div className="mb-5"><Link to="/runs" className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-blue-700"><ArrowLeft size={14} /> All runs</Link></div>
     <PageTitle eyebrow="RUN DETAIL" title={run.file_name} description={`Batch ${run.batch_id} · uploaded ${date(run.created_at)}`} actions={<Badge tone={statusTone(job?.status || run.status)}>{isActive && <span className="size-1.5 animate-pulse rounded-full bg-blue-600" />}{stateLabel(job?.status || run.status)}</Badge>} />
@@ -257,7 +322,7 @@ function timeline(run: RunDetail) {
   }
   const states = run.notification_counts || {};
   if (sum(states) > 0 || run.rows_imported > 0 && !["queued","running"].includes(run.match_job?.status || "")) {
-    const delivered = states.sent_to_local_test_inbox || 0;
+    const delivered = (states.sent_to_test_inbox || 0) + (states.sent_to_local_test_inbox || 0);
     const pending = states.pending || 0;
     steps.push({ stage:"notifications", title:"Controlled test notifications", status:pending ? delivered ? "partial" : "pending" : delivered ? "completed" : "not_sent", message:`${count(delivered)} match rows sent to Mailpit; ${count(pending)} pending.`, timestamp:undefined, detail:"Messages are routed to the configured test inbox.", tone:pending ? "active" : delivered ? "done" : "idle" });
   }

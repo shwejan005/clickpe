@@ -15,21 +15,43 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from alembic import command
+from alembic.config import Config
 import requests
 from fastapi import BackgroundTasks, Body, Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select, text, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from .discovery import SOURCES, discover_product
 from . import firebase_auth
+from .validation import normalized_segment as _normalized_segment, validate_row
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("loan-engine")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://loan_engine:local-dev-password@localhost:5432/loan_engine")
+def database_url() -> str | URL:
+    configured_url = os.getenv("DATABASE_URL", "").strip()
+    if configured_url:
+        return configured_url
+    host = os.getenv("DB_HOST", "").strip()
+    if host:
+        return URL.create(
+            "postgresql+psycopg2",
+            username=os.getenv("DB_USER", "loan_engine"),
+            password=os.getenv("DB_PASSWORD", ""),
+            host=host,
+            port=int(os.getenv("DB_PORT", "5432")),
+            database=os.getenv("DB_NAME", "loan_engine"),
+            query={"sslmode": os.getenv("DB_SSLMODE", "require")},
+        )
+    return "postgresql+psycopg2://loan_engine:local-dev-password@localhost:5432/loan_engine"
+
+
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
+UPLOAD_STORAGE_MODE = os.getenv("UPLOAD_STORAGE_MODE", "local").strip().lower()
 N8N_MATCH_WEBHOOK = os.getenv("N8N_MATCH_WEBHOOK", "http://localhost:5678/webhook/loan-match")
 N8N_NOTIFICATION_WEBHOOK = os.getenv("N8N_NOTIFICATION_WEBHOOK", "http://localhost:5678/webhook/loan-notify")
 NOTIFICATION_TEST_RECIPIENT = os.getenv("NOTIFICATION_TEST_RECIPIENT", "").strip()
@@ -45,11 +67,12 @@ NOTIFICATION_CLAIM_TTL = timedelta(minutes=15)
 LEGACY_WORKSPACE_ID = "local-default"
 CSRF_COOKIE_NAME = "clickpe_csrf"
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+SESSION_COOKIE_DOMAIN = os.getenv("SESSION_COOKIE_DOMAIN", "").strip() or None
 REQUIRED_COLUMNS = {
     "user_id", "name", "email", "monthly_income", "credit_score", "employment_status", "age"
 }
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(database_url(), pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -380,39 +403,6 @@ def trigger_matching(batch_id: str) -> None:
         logger.warning("Could not trigger n8n for batch %s: %s", batch_id, exc)
 
 
-def validate_row(row: dict[str, str | None], row_number: int) -> tuple[dict[str, Any] | None, str | None]:
-    try:
-        user_id = (row.get("user_id") or "").strip()
-        name = (row.get("name") or "").strip()
-        email = (row.get("email") or "").strip()
-        employment_status = (row.get("employment_status") or "").strip()
-        if not all((user_id, name, email, employment_status)):
-            raise ValueError("user_id, name, email, and employment_status are required")
-        if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
-            raise ValueError("email is not valid")
-        monthly_income = float(row.get("monthly_income", ""))
-        credit_score = int(row.get("credit_score", ""))
-        age = int(row.get("age", ""))
-        if monthly_income <= 0:
-            raise ValueError("monthly_income must be greater than zero")
-        if not 0 <= credit_score <= 1000:
-            raise ValueError("credit_score must be between 0 and 1000")
-        if not 18 <= age <= 100:
-            raise ValueError("age must be between 18 and 100")
-        return ({
-            "external_user_id": user_id,
-            "name": name,
-            "email": email,
-            "monthly_income": monthly_income,
-            "credit_score": credit_score,
-            "employment_status": employment_status,
-            "employment_segment": _normalized_segment(employment_status),
-            "age": age,
-        }, None)
-    except (TypeError, ValueError) as exc:
-        return None, f"Row {row_number}: {exc}"
-
-
 app = FastAPI(title="Loan Eligibility Engine API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -426,93 +416,11 @@ app.add_middleware(
 @app.on_event("startup")
 def initialize_database() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(bind=engine)
-    # create_all does not update existing local volumes; add/backfill these fields safely.
-    with engine.begin() as connection:
-        connection.execute(text(
-            "INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at) "
-            "ON CONFLICT (id) DO NOTHING"
-        ), {"id": LEGACY_WORKSPACE_ID, "name": DEFAULT_WORKSPACE_NAME, "created_at": datetime.now(timezone.utc)})
-        connection.execute(text(
-            "ALTER TABLE upload_batches ADD COLUMN IF NOT EXISTS workspace_id VARCHAR(36)"
-        ))
-        connection.execute(text(
-            "UPDATE upload_batches SET workspace_id = :workspace_id WHERE workspace_id IS NULL"
-        ), {"workspace_id": LEGACY_WORKSPACE_ID})
-        connection.execute(text("ALTER TABLE upload_batches ALTER COLUMN workspace_id SET NOT NULL"))
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_upload_batches_workspace_id ON upload_batches (workspace_id)"))
-        connection.execute(text("""
-            DO $$ DECLARE c RECORD; BEGIN
-              FOR c IN SELECT conname FROM pg_constraint
-                WHERE conrelid = 'upload_batches'::regclass AND contype = 'u'
-                  AND pg_get_constraintdef(oid) = 'UNIQUE (content_sha256)'
-              LOOP EXECUTE format('ALTER TABLE upload_batches DROP CONSTRAINT %I', c.conname); END LOOP;
-              IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_upload_workspace_hash') THEN
-                ALTER TABLE upload_batches ADD CONSTRAINT uq_upload_workspace_hash UNIQUE (workspace_id, content_sha256);
-              END IF;
-            END $$;
-        """))
-        connection.execute(text("""
-            DO $$ BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_upload_batches_workspace_id') THEN
-                ALTER TABLE upload_batches ADD CONSTRAINT fk_upload_batches_workspace_id
-                  FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE;
-              END IF;
-            END $$;
-        """))
-        connection.execute(text(
-            "ALTER TABLE applicants ADD COLUMN IF NOT EXISTS employment_segment VARCHAR(40)"
-        ))
-        connection.execute(text(
-            "UPDATE applicants SET employment_segment = CASE "
-            "WHEN lower(employment_status) LIKE '%self%' "
-            "OR lower(employment_status) LIKE '%business%' THEN 'self-employed' "
-            "WHEN lower(employment_status) LIKE '%unemploy%' "
-            "OR lower(employment_status) LIKE '%student%' "
-            "OR lower(employment_status) LIKE '%retired%' THEN lower(replace(trim(employment_status), '_', '-')) "
-            "WHEN lower(employment_status) LIKE '%salary%' "
-            "OR lower(employment_status) LIKE '%salaried%' "
-            "OR lower(employment_status) LIKE '%employ%' THEN 'salaried' "
-            "ELSE lower(replace(trim(employment_status), '_', '-')) END "
-            "WHERE employment_segment IS NULL"
-        ))
-        connection.execute(text(
-            "ALTER TABLE loan_matches ADD COLUMN IF NOT EXISTS match_status VARCHAR(32) NOT NULL DEFAULT 'potential'"
-        ))
-        connection.execute(text(
-            "ALTER TABLE loan_products ADD COLUMN IF NOT EXISTS criteria_version INTEGER NOT NULL DEFAULT 1"
-        ))
-        connection.execute(text(
-            "ALTER TABLE loan_matches ADD COLUMN IF NOT EXISTS criteria_version INTEGER NOT NULL DEFAULT 1"
-        ))
-        connection.execute(text(
-            "ALTER TABLE loan_matches ADD COLUMN IF NOT EXISTS notification_claim_id VARCHAR(36)"
-        ))
-        connection.execute(text(
-            "ALTER TABLE loan_matches ADD COLUMN IF NOT EXISTS notification_claimed_at TIMESTAMPTZ"
-        ))
-        connection.execute(text("""
-            DO $$ BEGIN
-              IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_match_applicant_product') THEN
-                ALTER TABLE loan_matches DROP CONSTRAINT uq_match_applicant_product;
-              END IF;
-              IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_match_applicant_product_criteria') THEN
-                ALTER TABLE loan_matches ADD CONSTRAINT uq_match_applicant_product_criteria
-                  UNIQUE (applicant_id, product_id, criteria_version);
-              END IF;
-            END $$;
-        """))
-        connection.execute(text("ALTER TABLE match_jobs ADD COLUMN IF NOT EXISTS progress_pairs INTEGER NOT NULL DEFAULT 0"))
-        connection.execute(text("ALTER TABLE match_jobs ADD COLUMN IF NOT EXISTS created_matches INTEGER NOT NULL DEFAULT 0"))
-        connection.execute(text("ALTER TABLE match_jobs ADD COLUMN IF NOT EXISTS needs_information_pairs INTEGER NOT NULL DEFAULT 0"))
-        connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_applicants_batch_segment "
-            "ON applicants (batch_id, employment_segment)"
-        ))
-        connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_loan_matches_pending_notifications "
-            "ON loan_matches (batch_id, notification_status, applicant_id)"
-        ))
+    config = Config(str(Path(__file__).resolve().parent.parent / "migrations" / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).resolve().parent.parent / "migrations"))
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
 
 
 @app.get("/api/health")
@@ -535,10 +443,11 @@ def operations_health(context: AuthContext = Depends(get_current_user), db: Sess
     except Exception:
         statuses["database_status"] = "unavailable"
     statuses["firebase_status"] = "ok" if firebase_auth.firebase_auth_ready() else "not_configured"
-    for name, url in (
-        ("n8n_status", "http://n8n:5678/healthz"),
-        ("mailpit_status", "http://mailpit:8025/api/v1/info"),
-    ):
+    statuses["notification_transport"] = os.getenv("LOAN_NOTIFICATION_TRANSPORT", "mailpit").strip().lower()
+    dependencies = [("n8n_status", "http://n8n:5678/healthz")]
+    if statuses["notification_transport"] == "mailpit":
+        dependencies.append(("mailpit_status", "http://mailpit:8025/api/v1/info"))
+    for name, url in dependencies:
         try:
             response = requests.get(url, timeout=2)
             statuses[name] = "ok" if response.ok else "unavailable"
@@ -556,6 +465,7 @@ def auth_csrf(response: Response) -> dict[str, str]:
         httponly=False,
         secure=SESSION_COOKIE_SECURE,
         samesite="lax",
+        domain=SESSION_COOKIE_DOMAIN,
         path="/",
     )
     return {"csrf_token": token}
@@ -591,6 +501,7 @@ def auth_session(
         httponly=True,
         secure=SESSION_COOKIE_SECURE,
         samesite="lax",
+        domain=SESSION_COOKIE_DOMAIN,
         path="/",
     )
     return {"status": "signed_in"}
@@ -599,7 +510,8 @@ def auth_session(
 @app.post("/api/auth/logout")
 def auth_logout(request: Request, response: Response) -> dict[str, str]:
     check_csrf(request)
-    response.delete_cookie(firebase_auth.SESSION_COOKIE_NAME, path="/", secure=SESSION_COOKIE_SECURE, httponly=True, samesite="lax")
+    response.delete_cookie(firebase_auth.SESSION_COOKIE_NAME, path="/", secure=SESSION_COOKIE_SECURE,
+                           httponly=True, samesite="lax", domain=SESSION_COOKIE_DOMAIN)
     return {"status": "signed_out"}
 
 
@@ -714,6 +626,8 @@ async def upload_csv(
     db: Session = Depends(get_db),
     context: AuthContext = Depends(get_current_user),
 ) -> dict[str, Any]:
+    if UPLOAD_STORAGE_MODE == "s3":
+        raise HTTPException(status_code=405, detail="Use the direct-to-S3 upload flow in this deployment")
     require_analyst(context)
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Choose a .csv file")
@@ -947,6 +861,24 @@ def get_upload(batch_id: str, context: AuthContext = Depends(get_current_user), 
     return batch_payload(batch, duplicate=False)
 
 
+@app.get("/api/uploads/by-content/{content_sha256}")
+def get_upload_by_content(
+    content_sha256: str,
+    context: AuthContext = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Resolve an S3 upload after the asynchronous event consumer commits it."""
+    if not re.fullmatch(r"[a-fA-F0-9]{64}", content_sha256):
+        raise HTTPException(status_code=400, detail="Invalid content digest")
+    batch = db.scalar(select(UploadBatch).where(
+        UploadBatch.workspace_id == context.workspace_id,
+        UploadBatch.content_sha256 == content_sha256.lower(),
+    ))
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Upload is still processing")
+    return batch_payload(batch, duplicate=True)
+
+
 @app.post("/api/discovery/run")
 def run_discovery(context: AuthContext = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     if context.platform_role != "platform_admin":
@@ -1175,17 +1107,6 @@ def list_products(context: AuthContext = Depends(get_current_user), db: Session 
         "last_checked_at": product.last_checked_at.isoformat() if product.last_checked_at else None,
         "stale": product.status != "verified" or not product.last_checked_at or product.last_checked_at < now - timedelta(hours=48),
     } for product in products]
-
-
-def _normalized_segment(value: str) -> str:
-    normalized = value.strip().lower().replace("_", "-")
-    if "self" in normalized or "business" in normalized:
-        return "self-employed"
-    if any(term in normalized for term in ("unemploy", "student", "retired")):
-        return normalized
-    if "salary" in normalized or "salaried" in normalized or "employ" in normalized:
-        return "salaried"
-    return normalized
 
 
 def _match_reasons(lender: str, rules: dict[str, Any]) -> tuple[list[str], str]:
@@ -1479,7 +1400,7 @@ def notification_messages(
     if not batch:
         raise HTTPException(status_code=404, detail="Upload batch not found")
     if not NOTIFICATION_TEST_RECIPIENT:
-        return {"batch_id": batch_id, "messages": [], "has_more": False, "note": "Set NOTIFICATION_TEST_RECIPIENT to a controlled local test inbox before enabling demo notifications."}
+        return {"batch_id": batch_id, "messages": [], "has_more": False, "note": "Set NOTIFICATION_TEST_RECIPIENT to a controlled test inbox before enabling demo notifications."}
 
     requested_size = int(payload.get("page_size", NOTIFICATION_PAGE_SIZE))
     if not 1 <= requested_size <= 25:
@@ -1489,7 +1410,7 @@ def notification_messages(
     delivered_count = db.scalar(
         select(func.count(func.distinct(Match.applicant_id))).where(
             Match.batch_id == batch_id,
-            Match.notification_status == "sent_to_local_test_inbox",
+            Match.notification_status.in_(["sent_to_test_inbox", "sent_to_local_test_inbox"]),
         )
     ) or 0
     remaining_cap = max(0, NOTIFICATION_MAX_PER_BATCH - delivered_count)
@@ -1601,13 +1522,16 @@ def complete_notifications(
         Match.notification_claim_id == claim_id,
     ).with_for_update()).all()
     for match in matches:
-        match.notification_status = "sent_to_local_test_inbox" if delivered else "pending"
+        match.notification_status = "sent_to_test_inbox" if delivered else "pending"
         match.notification_claim_id = None
         match.notification_claimed_at = None
     if matches:
+        channel = str(payload.get("channel", "mailpit"))
+        if channel not in {"mailpit", "ses"}:
+            raise HTTPException(status_code=400, detail="channel must be mailpit or ses")
         record_event(db, batch.workspace_id, "notifications", "delivered" if delivered else "retry_pending",
-                     "Test notification delivered" if delivered else "Test notification failed and returned to pending",
-                     batch_id=batch_id, details={"match_rows_updated": len(matches)})
+                     f"Controlled test notification {'delivered via ' + channel if delivered else 'failed and returned to pending'}",
+                     batch_id=batch_id, details={"match_rows_updated": len(matches), "channel": channel})
     db.commit()
     pending_count = db.scalar(select(func.count()).select_from(Match).where(
         Match.batch_id == batch_id,
@@ -1637,7 +1561,7 @@ def notification_status(batch_id: str, context: AuthContext = Depends(get_curren
     ).all()
     sent_recipients = db.scalar(select(func.count(func.distinct(Match.applicant_id))).where(
         Match.batch_id == batch_id,
-        Match.notification_status == "sent_to_local_test_inbox",
+        Match.notification_status.in_(["sent_to_test_inbox", "sent_to_local_test_inbox"]),
     )) or 0
     return {
         "batch_id": batch_id,
@@ -1659,7 +1583,7 @@ def start_notifications(
     if batch is None:
         raise HTTPException(status_code=404, detail="Upload batch not found")
     if not NOTIFICATION_TEST_RECIPIENT:
-        raise HTTPException(status_code=409, detail="Local test recipient is not configured")
+        raise HTTPException(status_code=409, detail="Controlled test recipient is not configured")
     try:
         response = requests.post(
             N8N_NOTIFICATION_WEBHOOK,
@@ -1670,14 +1594,14 @@ def start_notifications(
         response.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("Could not start test notifications for batch %s: %s", batch_id, exc)
-        raise HTTPException(status_code=503, detail="Could not start the local notification workflow") from exc
-    record_event(db, batch.workspace_id, "notifications", "queued", "Local test notification workflow started",
+        raise HTTPException(status_code=503, detail="Could not start the test notification workflow") from exc
+    record_event(db, batch.workspace_id, "notifications", "queued", "Controlled test notification workflow started",
                  batch_id=batch_id, actor_user_id=context.user.id)
     db.commit()
     return {
         "batch_id": batch_id,
         "status": "started",
-        "recipient": "controlled local test inbox",
+        "recipient": "controlled test inbox",
         "page_size": NOTIFICATION_PAGE_SIZE,
         "per_batch_cap": NOTIFICATION_MAX_PER_BATCH,
     }

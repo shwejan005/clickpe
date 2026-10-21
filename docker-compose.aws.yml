@@ -1,0 +1,101 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: ${DB_HOST:?Set DB_HOST}
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-loan_engine}
+      DB_USER: ${DB_MASTER_USERNAME:?Set DB_MASTER_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      DB_SSLMODE: require
+      UPLOAD_STORAGE_MODE: s3
+      UPLOAD_DIR: /data/uploads
+      N8N_MATCH_WEBHOOK: http://n8n:5678/webhook/loan-match
+      N8N_NOTIFICATION_WEBHOOK: http://n8n:5678/webhook/loan-notify
+      CORS_ORIGINS: ${APP_ORIGIN:?Set APP_ORIGIN}
+      NOTIFICATION_TEST_RECIPIENT: ${NOTIFICATION_TEST_RECIPIENT:?Set a controlled test inbox}
+      LOAN_NOTIFICATION_TRANSPORT: ses
+      MAIL_FROM: ${SES_FROM_EMAIL:?Set SES_FROM_EMAIL}
+      NOTIFICATION_PAGE_SIZE: ${NOTIFICATION_PAGE_SIZE:-10}
+      NOTIFICATION_MAX_PER_BATCH: ${NOTIFICATION_MAX_PER_BATCH:-25}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gemini-flash-latest}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?Set FIREBASE_PROJECT_ID}
+      FIREBASE_SERVICE_ACCOUNT_FILE: /run/secrets/firebase-service-account.json
+      FIREBASE_BOOTSTRAP_ADMIN_EMAIL: ${FIREBASE_BOOTSTRAP_ADMIN_EMAIL:?Set FIREBASE_BOOTSTRAP_ADMIN_EMAIL}
+      DEFAULT_WORKSPACE_NAME: ${DEFAULT_WORKSPACE_NAME:-ClickPe AWS Workspace}
+      SESSION_COOKIE_SECURE: "true"
+      SESSION_COOKIE_DOMAIN: ${SESSION_COOKIE_DOMAIN:?Set a shared parent cookie domain}
+      N8N_SERVICE_TOKEN: ${N8N_SERVICE_TOKEN:?Set N8N_SERVICE_TOKEN}
+    volumes:
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      n8n:
+        condition: service_started
+
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      N8N_HOST: ${N8N_DOMAIN:?Set N8N_DOMAIN}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: https
+      WEBHOOK_URL: https://${N8N_DOMAIN:?Set N8N_DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${N8N_DOMAIN:?Set N8N_DOMAIN}/
+      N8N_PROXY_HOPS: 1
+      N8N_SECURE_COOKIE: "true"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?Set N8N_ENCRYPTION_KEY}
+      N8N_SERVICE_TOKEN: ${N8N_SERVICE_TOKEN:?Set N8N_SERVICE_TOKEN}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_AWS_SYSTEM_CREDENTIALS_ACCESS_ENABLED: "true"
+      LOAN_NOTIFICATION_TRANSPORT: ses
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data_aws:/home/node/.n8n
+      - ./workflows:/opt/loan-engine/workflows:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_URL: https://${API_DOMAIN:?Set API_DOMAIN}
+        VITE_UPLOAD_MODE: s3
+        VITE_UPLOAD_PRESIGN_URL: https://${UPLOAD_API_DOMAIN:?Set UPLOAD_API_DOMAIN}/uploads/presign
+        VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:?Set VITE_FIREBASE_API_KEY}
+        VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:?Set VITE_FIREBASE_AUTH_DOMAIN}
+        VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:?Set VITE_FIREBASE_PROJECT_ID}
+        VITE_FIREBASE_STORAGE_BUCKET: ${VITE_FIREBASE_STORAGE_BUCKET:-}
+        VITE_FIREBASE_MESSAGING_SENDER_ID: ${VITE_FIREBASE_MESSAGING_SENDER_ID:?Set VITE_FIREBASE_MESSAGING_SENDER_ID}
+        VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:?Set VITE_FIREBASE_APP_ID}
+        VITE_FIREBASE_MEASUREMENT_ID: ${VITE_FIREBASE_MEASUREMENT_ID:-}
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN}
+      N8N_DOMAIN: ${N8N_DOMAIN:?Set N8N_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - n8n
+      - frontend
+
+volumes:
+  n8n_data_aws:
+  caddy_data:
+  caddy_config:

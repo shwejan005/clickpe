@@ -1,5 +1,5 @@
 {
-  "name": "C - Safe Local Test Notifications",
+  "name": "C - Controlled Test Notifications",
   "nodes": [
     {
       "parameters": {
@@ -63,6 +63,38 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $env.LOAN_NOTIFICATION_TRANSPORT === 'ses' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "37c7ef20-f3a9-4bf9-96c6-8586940772a0",
+      "name": "Choose SES or local Mailpit",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
         "fromEmail": "={{ $json.from }}",
         "toEmail": "={{ $json.to }}",
         "subject": "={{ $json.subject }}",
@@ -83,11 +115,35 @@
     },
     {
       "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": false,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.text }}",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": [
+          "={{ $json.to }}"
+        ],
+        "additionalFields": {}
+      },
+      "id": "f5cd310d-c615-4be8-b9be-3b4116bf4d1d",
+      "name": "Send through AWS SES",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "http://api:8000/api/workflows/notifications/complete",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ { batch_id: $('One email per applicant').item.json.batch_id, applicant_id: $('One email per applicant').item.json.applicant_id, claim_id: $('One email per applicant').item.json.claim_id, delivered: true, is_last: $('One email per applicant').item.json.is_last, continue_after_page: $('One email per applicant').item.json.continue_after_page } }}",
+        "jsonBody": "={{ { batch_id: $('One email per applicant').item.json.batch_id, applicant_id: $('One email per applicant').item.json.applicant_id, claim_id: $('One email per applicant').item.json.claim_id, delivered: true, channel: ($env.LOAN_NOTIFICATION_TRANSPORT === 'ses' ? 'ses' : 'mailpit'), is_last: $('One email per applicant').item.json.is_last, continue_after_page: $('One email per applicant').item.json.continue_after_page } }}",
         "options": {
           "timeout": 30000
         },
@@ -220,6 +276,24 @@
       "main": [
         [
           {
+            "node": "Choose SES or local Mailpit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Choose SES or local Mailpit": {
+      "main": [
+        [
+          {
+            "node": "Send through AWS SES",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Send through local Mailpit SMTP",
             "type": "main",
             "index": 0
@@ -228,6 +302,17 @@
       ]
     },
     "Send through local Mailpit SMTP": {
+      "main": [
+        [
+          {
+            "node": "Mark test delivery complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send through AWS SES": {
       "main": [
         [
           {
@@ -298,10 +383,12 @@
     {
       "id": "31a7fd85-2fa8-4eb1-a548-3129722e38a3",
       "name": "Deliver bounded test notifications",
-      "description": "Builds safe recipient messages, sends them to Mailpit, then records delivery before continuing bounded pages.",
+      "description": "Builds safe test-recipient messages, routes through SES or Mailpit, then records delivery before continuing bounded pages.",
       "nodeNames": [
         "Build test-inbox messages",
         "One email per applicant",
+        "Choose SES or local Mailpit",
+        "Send through AWS SES",
         "Send through local Mailpit SMTP",
         "Mark test delivery complete"
       ]

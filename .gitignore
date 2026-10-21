@@ -7,3 +7,5 @@ uploads/*
 !uploads/.gitkeep
 secrets/
 *.log
+.serverless/
+backend/.pytest_cache/

@@ -1,0 +1,11 @@
+{$APP_DOMAIN} {
+	reverse_proxy frontend:80
+}
+
+{$API_DOMAIN} {
+	reverse_proxy api:8000
+}
+
+{$N8N_DOMAIN} {
+	reverse_proxy n8n:5678
+}
