@@ -43,6 +43,8 @@ flowchart TD
 
 Pull-request workflows do not request `id-token: write`, so unmerged code cannot assume the AWS deployment role.
 
+The `main` branch is protected: changes must arrive through a pull request, and the backend, frontend, and configuration-validation checks are required before merge. Administrators are subject to the same protection; zero human approvals are required so this single-maintainer demo can still merge after checks pass.
+
 ## CD behavior on `main`
 
 On each `main` push, `cd.yml` calls the CI workflow and runs only if that reusable CI job succeeds:
