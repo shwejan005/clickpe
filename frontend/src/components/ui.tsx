@@ -68,9 +68,9 @@ export function LoadingBlock({ label = "Loading workspace" }: { label?: string }
   return <div className="flex min-h-40 items-center justify-center gap-3 text-sm text-slate-500"><span className="size-5 animate-spin rounded-full border-2 border-blue-200 border-t-blue-600 motion-reduce:animate-none" />{label}</div>;
 }
 
-export function AlertBox({ children, tone = "error", className }: { children: ReactNode; tone?: "error" | "success" | "info"; className?: string }) {
-  const colors = { error: "border-red-200 bg-red-50 text-red-800", success: "border-emerald-200 bg-emerald-50 text-emerald-800", info: "border-blue-200 bg-blue-50 text-blue-800" };
-  return <div role={tone === "error" ? "alert" : "status"} className={cn("rounded-xl border px-4 py-3 text-sm leading-6", colors[tone], className)}>{children}</div>;
+export function AlertBox({ children, tone = "error", className }: { children: ReactNode; tone?: "error" | "warning" | "success" | "info"; className?: string }) {
+  const colors = { error: "border-red-200 bg-red-50 text-red-800", warning: "border-amber-200 bg-amber-50 text-amber-900", success: "border-emerald-200 bg-emerald-50 text-emerald-800", info: "border-blue-200 bg-blue-50 text-blue-800" };
+  return <div role={tone === "error" || tone === "warning" ? "alert" : "status"} className={cn("rounded-xl border px-4 py-3 text-sm leading-6", colors[tone], className)}>{children}</div>;
 }
 
 export function ConfirmDialog({ open, onOpenChange, title, description, confirmText, onConfirm, busy, destructive = false }: {

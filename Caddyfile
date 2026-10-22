@@ -3,7 +3,15 @@
 }
 
 {$API_DOMAIN} {
-	reverse_proxy api:8000
+	@presign path /uploads/presign
+	handle @presign {
+		reverse_proxy https://{$UPLOAD_API_DOMAIN} {
+			header_up Host {upstream_hostport}
+		}
+	}
+	handle {
+		reverse_proxy api:8000
+	}
 }
 
 {$N8N_DOMAIN} {

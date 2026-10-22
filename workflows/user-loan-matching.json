@@ -1,4 +1,5 @@
 {
+  "id": "qyxDzuhqde7gQ9gz",
   "name": "B - User Loan Matching",
   "nodes": [
     {
@@ -21,7 +22,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/api/workflows/match",
+        "url": "http://api:8000/api/workflows/match-candidates",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ { batch_id: $json.body.batch_id } }}",
@@ -39,11 +40,54 @@
         }
       },
       "id": "9c2228e7-4388-45ec-8bc2-fba299424f87",
-      "name": "Set-based SQL matching and bulk persistence",
+      "name": "SQL prefilter candidate pairs",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
         500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const page = $input.first().json;\nconst matches = (page.candidates || []).map((candidate) => {\n  const rules = candidate.segment_rules || {};\n  const missing = [];\n  const minimumIncome = rules.minimum_monthly_income_inr;\n  if (rules.salary_account_required) {\n    missing.push('Confirm you have the required lender salary account');\n    missing.push('The lender does not publish a numeric credit-score cutoff; confirm its internal policy');\n  }\n  const thresholds = rules.income_thresholds_by_sector_inr;\n  if (thresholds && typeof thresholds === 'object') {\n    const labels = Object.entries(thresholds).map(([key, amount]) => {\n      const normalized = key.toLowerCase();\n      const label = normalized.includes('government') || normalized.includes('defence') ? 'Government/Defence' : normalized.includes('corporate') ? 'Corporate' : key.replaceAll('_', ' ').replace(/\\b\\w/g, (letter) => letter.toUpperCase());\n      return `${label}: INR ${Number(amount).toLocaleString('en-IN')} net monthly salary`;\n    }).join(', ');\n    const serviceMonths = Array.isArray(rules.minimum_service_months_by_sector) ? rules.minimum_service_months_by_sector : [];\n    const serviceNote = serviceMonths.length ? ` Minimum service is ${serviceMonths[0]} months for Government/Defence and ${serviceMonths[serviceMonths.length - 1]} months for Corporate applicants.` : '';\n    missing.push(`Confirm your sector and applicable threshold (${labels}).${serviceNote} The CSV does not identify sector or whether income is net salary.`);\n  }\n  if (rules.total_work_experience_years) {\n    missing.push(candidate.lender === 'HDFC Bank' ? 'Confirm an eligible employer, at least 2 years of total work experience, and at least 1 year with the current employer' : \"Confirm the lender's required work experience\");\n  }\n  const reasons = ['Potential fit against available published criteria; this is not lender approval.'];\n  if (minimumIncome !== null && minimumIncome !== undefined) {\n    const amount = Number(minimumIncome).toLocaleString('en-IN');\n    reasons.push(candidate.lender === 'HDFC Bank' ? `Reported monthly income is at or above INR ${amount}; HDFC specifies net monthly income, which this file does not distinguish from gross income.` : `Monthly income meets the published minimum of INR ${amount}.`);\n  }\n  if (rules.credit_score_preferred) reasons.push(`A credit score of ${rules.credit_score_preferred} or above is preferred, not a hard minimum.`);\n  reasons.push(...missing);\n  return { applicant_id: candidate.applicant_id, product_id: candidate.product_id, criteria_version: candidate.criteria_version, match_status: missing.length ? 'needs_information' : 'potential', reasons };\n});\nreturn [{ json: { job_id: page.job_id, batch_id: page.batch_id, criteria_fingerprint: page.criteria_fingerprint, applicants_checked: page.applicants_checked, verified_products_checked: page.verified_products_checked, matches, idempotent_replay: page.idempotent_replay === true } }];"
+      },
+      "id": "c0a4a24b-6cc7-4f89-a4b4-83942bf1fb19",
+      "name": "Evaluate reduced pairs in n8n",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/api/workflows/match-results",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { job_id: $json.job_id, batch_id: $json.batch_id, criteria_fingerprint: $json.criteria_fingerprint, applicants_checked: $json.applicants_checked, verified_products_checked: $json.verified_products_checked, matches: $json.matches } }}",
+        "options": {
+          "timeout": 120000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Workflow-Token",
+              "value": "={{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "550e4dd4-8fc1-4e5f-b419-3be1a59f4c60",
+      "name": "Bulk persist evaluated matches",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
         300
       ]
     },
@@ -72,7 +116,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        760,
+        1180,
         300
       ]
     },
@@ -110,7 +154,29 @@
     }
   ],
   "connections": {
-    "Set-based SQL matching and bulk persistence": {
+    "SQL prefilter candidate pairs": {
+      "main": [
+        [
+          {
+            "node": "Evaluate reduced pairs in n8n",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate reduced pairs in n8n": {
+      "main": [
+        [
+          {
+            "node": "Bulk persist evaluated matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bulk persist evaluated matches": {
       "main": [
         [
           {
@@ -136,7 +202,7 @@
       "main": [
         [
           {
-            "node": "Set-based SQL matching and bulk persistence",
+            "node": "SQL prefilter candidate pairs",
             "type": "main",
             "index": 0
           }
@@ -145,7 +211,7 @@
       ]
     }
   },
-  "active": false,
+  "active": true,
   "settings": {
     "executionOrder": "v1"
   },

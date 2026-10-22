@@ -1,12 +1,12 @@
 """Upgrade legacy local tables and add workspace and matching indexes.
 
-Revision ID: 0002_workspace_matching_backfills
+Revision ID: 0002_workspace_matching
 Revises: 0001_initial_schema
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0002_workspace_matching_backfills"
+revision = "0002_workspace_matching"
 down_revision = "0001_initial_schema"
 branch_labels = None
 depends_on = None

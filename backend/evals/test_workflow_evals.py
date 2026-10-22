@@ -11,6 +11,66 @@ from app.main import Applicant, LoanProduct, Match, _match_reasons, _normalized_
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_first_verified_google_signin_creates_an_isolated_workspace(monkeypatch):
+    class FakeDB:
+        def __init__(self):
+            self.added = []
+
+        def scalar(self, statement):
+            return None
+
+        def get(self, model, key):
+            return None
+
+        def add(self, value):
+            self.added.append(value)
+
+        def flush(self):
+            for value in self.added:
+                if isinstance(value, main.AppUser):
+                    value.id = 41
+
+        def commit(self):
+            pass
+
+        def refresh(self, value):
+            pass
+
+        def scalars(self, statement):
+            rows = [value for value in self.added if isinstance(value, main.WorkspaceMembership)]
+            return Mock(all=Mock(return_value=rows))
+
+    monkeypatch.setattr(main, "FIREBASE_BOOTSTRAP_ADMIN_EMAIL", "")
+    monkeypatch.setattr(main.firebase_auth, "verify_session_cookie", lambda _: {
+        "uid": "first-time-google-user",
+        "email": "new.person@example.test",
+        "email_verified": True,
+        "name": "New Person",
+    })
+    db = FakeDB()
+    context = main.get_current_user(
+        request=Mock(method="GET"), db=db, clickpe_session="verified-session",
+        x_workspace_id=None, x_workflow_token=None,
+    )
+
+    workspace = next(value for value in db.added if isinstance(value, main.Workspace))
+    membership = next(value for value in db.added if isinstance(value, main.WorkspaceMembership))
+    assert workspace.id != main.LEGACY_WORKSPACE_ID
+    assert workspace.name == "Personal workspace"
+    assert membership.workspace_id == workspace.id
+    assert membership.workspace_role == "workspace_admin"
+    assert membership.platform_role is None
+    assert context.workspace_id == workspace.id
+
+
+def test_login_page_copy_is_welcoming_and_does_not_require_an_invite():
+    page = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    assert "PRIVATE OPERATIONS WORKSPACE" not in page
+    assert "invited to your workspace" not in page
+    assert "Welcome to ClickPe" in page
+    assert "New to ClickPe? Continue with Google to get started." in page
+
+
 def _proposal_response(rules=None, evidence=None):
     result = {
         "rules": rules or [{
@@ -172,17 +232,31 @@ def test_workflow_b_matching_runs_before_notifications():
     _assert_connections_resolve(workflow)
     gate = "Authorize internal batch trigger"
     assert workflow["connections"]["Upload batch webhook"]["main"][0][0]["node"] == gate
-    assert workflow["connections"][gate]["main"][0][0]["node"] == "Set-based SQL matching and bulk persistence"
+    prefilter = "SQL prefilter candidate pairs"
+    evaluator = "Evaluate reduced pairs in n8n"
+    persistence = "Bulk persist evaluated matches"
+    assert workflow["connections"][gate]["main"][0][0]["node"] == prefilter
+    assert workflow["connections"][prefilter]["main"][0][0]["node"] == evaluator
+    assert workflow["connections"][evaluator]["main"][0][0]["node"] == persistence
+    assert workflow["connections"][persistence]["main"][0][0]["node"] == "Start notification workflow"
+    nodes = {node["name"]: node for node in workflow["nodes"]}
+    assert nodes[prefilter]["parameters"]["url"].endswith("/api/workflows/match-candidates")
+    assert "match_status" in nodes[evaluator]["parameters"]["jsCode"]
+    assert nodes[persistence]["parameters"]["url"].endswith("/api/workflows/match-results")
 
 
 def test_workflow_c_has_empty_page_guard_and_bounded_continuation():
     workflow = _workflow("user-notifications.json")
     _assert_connections_resolve(workflow)
     names = {node["name"] for node in workflow["nodes"]}
-    assert "Send through local Mailpit SMTP" in names
+    assert "Send through local Mailpit API" in names
     assert "Mark test delivery complete" in names
     assert "Continue next notification page" in names
     assert any(node["name"] == "One email per applicant" and "continue_after_page" in node["parameters"].get("jsCode", "") for node in workflow["nodes"])
+    local_sender = next(node for node in workflow["nodes"] if node["name"] == "Send through local Mailpit API")
+    assert local_sender["type"] == "n8n-nodes-base.httpRequest"
+    assert local_sender["parameters"]["url"] == "http://mailpit:8025/api/v1/send"
+    assert any(node["name"] == "Send through AWS SES" and node["type"] == "n8n-nodes-base.awsSes" for node in workflow["nodes"])
 
 
 def test_all_workflow_api_calls_use_runtime_service_token_and_webhooks_check_it():

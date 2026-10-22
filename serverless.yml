@@ -10,7 +10,7 @@ provider:
   httpApi:
     cors:
       allowedOrigins:
-        - ${env:APP_ORIGIN}
+        - ${env:APP_ORIGIN, 'http://localhost:5173'}
       allowedHeaders:
         - content-type
         - x-csrf-token
@@ -28,18 +28,14 @@ provider:
           - $request.header.Cookie
   ecr:
     scanOnPush: true
-    maxImages: 6
     images:
-      uploadWorker:
-        path: ./backend
-        file: Dockerfile.lambda
-        buildOptions:
-          - --platform=linux/amd64
+      upload-worker:
+        uri: ${env:UPLOAD_WORKER_IMAGE_URI}
   logs:
     lambda:
       retentionInDays: 14
     httpApi:
-      format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","sourceIp":"$context.identity.sourceIp","requestTime":"$context.requestTime"}'
+      format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","sourceIp":"$context.identity.sourceIp","requestTime":"$context.requestTime","integrationError":"$context.integrationErrorMessage","integrationStatus":"$context.integration.status","integrationLatency":"$context.integration.latency","authorizerError":"$context.authorizer.error","gatewayError":"$context.error.message"}'
 custom:
   uploadBucketName: ${self:service}-${sls:stage}-${aws:accountId}-${aws:region}
 
@@ -48,7 +44,7 @@ functions:
     role:
       Fn::GetAtt: [FirebaseAuthorizerRole, Arn]
     image:
-      name: uploadWorker
+      name: upload-worker
       command:
         - app.aws_ingestion.authorizer_handler
     timeout: 15
@@ -60,7 +56,7 @@ functions:
     role:
       Fn::GetAtt: [PresignUploadRole, Arn]
     image:
-      name: uploadWorker
+      name: upload-worker
       command:
         - app.aws_ingestion.presign_upload_handler
     timeout: 15
@@ -72,7 +68,7 @@ functions:
         - Ref: PrivateSubnetA
         - Ref: PrivateSubnetB
     environment:
-      APP_ORIGIN: ${env:APP_ORIGIN}
+      APP_ORIGIN: ${env:APP_ORIGIN, 'http://localhost:5173'}
       DB_HOST:
         Fn::GetAtt: [LoanDatabase, Endpoint.Address]
       DB_PORT: '5432'
@@ -93,12 +89,11 @@ functions:
     role:
       Fn::GetAtt: [IngestUploadRole, Arn]
     image:
-      name: uploadWorker
+      name: upload-worker
       command:
         - app.aws_ingestion.ingest_handler
     timeout: 120
     memorySize: 1024
-    reservedConcurrency: 5
     vpc:
       securityGroupIds:
         - Ref: LambdaSecurityGroup
@@ -115,7 +110,7 @@ functions:
       DB_SSLMODE: require
       UPLOAD_BUCKET:
         Ref: ApplicantUploads
-      N8N_MATCH_WEBHOOK: ${env:N8N_MATCH_WEBHOOK}
+      N8N_MATCH_WEBHOOK: ${env:N8N_MATCH_WEBHOOK, 'http://localhost:5678/webhook/loan-match'}
       N8N_SERVICE_TOKEN_SECRET_ARN: ${env:N8N_SERVICE_TOKEN_SECRET_ARN}
 resources:
   Resources:
@@ -414,7 +409,7 @@ resources:
         CorsConfiguration:
           CorsRules:
             - AllowedOrigins:
-                - ${env:APP_ORIGIN}
+                - ${env:APP_ORIGIN, 'http://localhost:5173'}
               AllowedMethods:
                 - POST
               AllowedHeaders:
@@ -429,7 +424,8 @@ resources:
               Prefix: incoming/
               ExpirationInDays: 7
         NotificationConfiguration:
-          EventBridgeConfiguration: {}
+          EventBridgeConfiguration:
+            EventBridgeEnabled: true
 
     UploadIngestionDlq:
       Type: AWS::SQS::Queue
@@ -503,11 +499,6 @@ resources:
           - Name: QueueName
             Value: { Fn::GetAtt: [UploadIngestionDlq, QueueName] }
 
-    SesSenderIdentity:
-      Type: AWS::SES::EmailIdentity
-      Properties:
-        EmailIdentity: ${env:SES_FROM_EMAIL}
-
     N8nSesRole:
       Type: AWS::IAM::Role
       Properties:
@@ -521,11 +512,11 @@ resources:
               Action: sts:AssumeRole
             - Effect: Allow
               Principal:
-                AWS: arn:${aws:partition}:iam::${aws:accountId}:root
+                AWS: arn:aws:iam::${aws:accountId}:root
               Action: sts:AssumeRole
               Condition:
                 StringEquals:
-                  aws:PrincipalArn: arn:${aws:partition}:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
+                  aws:PrincipalArn: arn:aws:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
                   sts:ExternalId: loan-engine-${sls:stage}-${aws:accountId}
         ManagedPolicyArns:
           - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
@@ -542,7 +533,7 @@ resources:
                     - arn:aws:ses:${aws:region}:${aws:accountId}:identity/${env:SES_FROM_EMAIL}
                 - Effect: Allow
                   Action: sts:AssumeRole
-                  Resource: arn:${aws:partition}:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
+                  Resource: arn:aws:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
         Tags:
           - Key: Name
             Value: ${self:service}-${sls:stage}-n8n-ses-role
@@ -553,23 +544,9 @@ resources:
         Roles:
           - { Ref: N8nSesRole }
 
-    UploadApiDomain:
-      Type: AWS::ApiGatewayV2::DomainName
-      Properties:
-        DomainName: ${env:UPLOAD_API_DOMAIN}
-        DomainNameConfigurations:
-          - CertificateArn: ${env:UPLOAD_API_CERTIFICATE_ARN}
-            EndpointType: REGIONAL
-            SecurityPolicy: TLS_1_2
-
-    UploadApiMapping:
-      Type: AWS::ApiGatewayV2::ApiMapping
-      DependsOn:
-        - HttpApiStage
-      Properties:
-        ApiId: { Ref: HttpApi }
-        DomainName: { Ref: UploadApiDomain }
-        Stage: '$default'
+    # No-domain mode: uploads go through the HttpApi execute-api endpoint
+    # (Output HttpApiEndpoint). Custom-domain resources are intentionally
+    # absent; re-add AWS::ApiGatewayV2::DomainName + ApiMapping when TLS is set up.
 
   Outputs:
     UploadBucketName:
@@ -578,12 +555,8 @@ resources:
       Value: { Fn::GetAtt: [LoanDatabase, MasterUserSecret.SecretArn] }
     DatabaseHost:
       Value: { Fn::GetAtt: [LoanDatabase, Endpoint.Address] }
-    UploadApiUrl:
-      Value: https://${env:UPLOAD_API_DOMAIN}/uploads/presign
-    UploadApiRegionalDomain:
-      Value: { Fn::GetAtt: [UploadApiDomain, RegionalDomainName] }
-    UploadApiRegionalHostedZoneId:
-      Value: { Fn::GetAtt: [UploadApiDomain, RegionalHostedZoneId] }
+    HttpApiEndpoint:
+      Value: { Fn::Sub: 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com' }
     N8nWorkflowSecurityGroupId:
       Value: { Ref: N8nWorkflowSecurityGroup }
     VpcId:

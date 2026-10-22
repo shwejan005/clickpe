@@ -269,7 +269,9 @@ def record_event(
         status=status,
         message=message[:500],
         details=details or {},
-        actor_user_id=actor_user_id,
+        # Internal workflow identities are deliberately ephemeral (id=0) and
+        # must not be persisted into the dashboard_events user foreign key.
+        actor_user_id=actor_user_id if actor_user_id and actor_user_id > 0 else None,
     ))
 
 
@@ -326,6 +328,7 @@ def get_current_user(
         workspace: Workspace | None = None
         workspace_role = "analyst"
         platform_role = None
+        accepted_invite: WorkspaceInvite | None = None
         if FIREBASE_BOOTSTRAP_ADMIN_EMAIL and email == FIREBASE_BOOTSTRAP_ADMIN_EMAIL:
             workspace = db.get(Workspace, LEGACY_WORKSPACE_ID)
             workspace_role = "workspace_admin"
@@ -337,9 +340,17 @@ def get_current_user(
             ).order_by(WorkspaceInvite.created_at.desc()))
             if invite:
                 workspace = db.get(Workspace, invite.workspace_id)
-                workspace_role = invite.workspace_role
+                if workspace is not None:
+                    workspace_role = invite.workspace_role
+                    accepted_invite = invite
         if workspace is None:
-            raise HTTPException(status_code=403, detail="Your Firebase account is valid but has not been invited to a workspace")
+            # Let a first-time, verified Google user start with their own
+            # isolated workspace. Never attach self-serve users to the shared
+            # legacy workspace or grant them a platform role.
+            workspace = Workspace(id=str(uuid.uuid4()), name="Personal workspace")
+            workspace_role = "workspace_admin"
+            platform_role = None
+            db.add(workspace)
         user = AppUser(
             firebase_uid=uid,
             email=email,
@@ -356,8 +367,8 @@ def get_current_user(
             platform_role=platform_role,
         )
         db.add(membership)
-        if workspace_role != "workspace_admin":
-            invite.accepted_by = user.id
+        if accepted_invite is not None:
+            accepted_invite.accepted_by = user.id
         db.commit()
         db.refresh(user)
     else:
@@ -486,14 +497,21 @@ def auth_session(
         decoded = firebase_auth.verify_client_id_token(id_token)
         if not decoded.get("email_verified"):
             raise HTTPException(status_code=403, detail="Verify your Firebase account email before signing in")
-        session_cookie = firebase_auth.create_session_cookie(id_token)
     except HTTPException:
         raise
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        logger.info("Firebase sign-in rejected: %s", type(exc).__name__)
+        logger.info("Firebase ID token verification failed: %s", type(exc).__name__)
         raise HTTPException(status_code=401, detail="Firebase sign-in could not be verified") from exc
+    try:
+        session_cookie = firebase_auth.create_session_cookie(id_token)
+    except RuntimeError as exc:
+        logger.error("Firebase session cookie creation failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Google sign-in succeeded, but ClickPe could not finish creating your session. Please try again shortly.") from exc
+    except Exception as exc:
+        logger.error("Firebase session cookie creation failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Google sign-in succeeded, but ClickPe could not finish creating your session. Please try again shortly.") from exc
     response.set_cookie(
         firebase_auth.SESSION_COOKIE_NAME,
         session_cookie,
@@ -931,8 +949,15 @@ def run_discovery(context: AuthContext = Depends(get_current_user), db: Session 
                     **previous_provenance,
                     "last_failed_check": result["provenance"],
                 }
-                if result["provenance"].get("llm_proposal"):
-                    failed_provenance["llm_proposal"] = result["provenance"]["llm_proposal"]
+                attempted_proposal = result["provenance"].get("llm_proposal")
+                previous_proposal = previous_provenance.get("llm_proposal")
+                if attempted_proposal and attempted_proposal.get("status") == "pending_human_review":
+                    failed_provenance["llm_proposal"] = attempted_proposal
+                elif previous_proposal and previous_proposal.get("status") != "failed":
+                    # A temporary Gemini/API or validation failure must not erase a
+                    # previously validated proposal. Keep it visible; approval still
+                    # checks that its source hash matches the latest lender page.
+                    failed_provenance["llm_proposal"] = previous_proposal
                 existing.provenance = failed_provenance
                 existing.status = "stale"
         db.flush()
@@ -945,7 +970,12 @@ def run_discovery(context: AuthContext = Depends(get_current_user), db: Session 
             "rate_max": result["rate_max"],
             "failures": result["provenance"]["failures"],
             "llm_review_required": bool(
-                (result["provenance"].get("llm_proposal") or {}).get("status") == "pending_human_review"
+                ((existing.provenance or {}).get("llm_proposal") or {}).get("status") == "pending_human_review"
+            ),
+            "llm_review_error": (
+                (result["provenance"].get("llm_proposal") or {}).get("error")
+                if (result["provenance"].get("llm_proposal") or {}).get("status") == "failed"
+                else None
             ),
         })
     db.commit()
@@ -957,10 +987,14 @@ def product_criteria_review_queue(context: AuthContext = Depends(get_current_use
     require_platform_reviewer(context)
     products = db.scalars(select(LoanProduct).order_by(LoanProduct.updated_at.desc())).all()
     items = []
+    issues = []
     for product in products:
         provenance = product.provenance or {}
         proposal = provenance.get("llm_proposal")
         if proposal and proposal.get("status") == "pending_human_review":
+            latest_sources = (provenance.get("last_failed_check") or {}).get("sources") or provenance.get("sources") or {}
+            current_eligibility = latest_sources.get("eligibility_url") or {}
+            source_current = bool(proposal.get("source_sha256")) and proposal.get("source_sha256") == current_eligibility.get("sha256")
             proposal_digest = hashlib.sha256(
                 json.dumps(proposal, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             ).hexdigest()
@@ -970,9 +1004,22 @@ def product_criteria_review_queue(context: AuthContext = Depends(get_current_use
                 "product_name": product.product_name,
                 "product_status": product.status,
                 "proposal_sha256": proposal_digest,
+                "source_current": source_current,
                 "proposal": proposal,
             })
-    return {"count": len(items), "items": items}
+        failed_attempt = (provenance.get("last_failed_check") or {}).get("llm_proposal") or {}
+        if not failed_attempt:
+            failed_attempt = provenance.get("llm_proposal") or {}
+        if failed_attempt.get("status") == "failed":
+            issues.append({
+                "product_id": product.id,
+                "lender": product.lender,
+                "product_name": product.product_name,
+                "product_status": product.status,
+                "error": failed_attempt.get("error") or "Gemini could not produce a validated proposal",
+                "proposal_retained": bool(proposal and proposal.get("status") == "pending_human_review"),
+            })
+    return {"count": len(items), "items": items, "issues": issues}
 
 
 @app.post("/api/products/{product_id}/criteria-review")
@@ -1159,6 +1206,233 @@ def _match_reasons(lender: str, rules: dict[str, Any]) -> tuple[list[str], str]:
         reasons.append(f"A credit score of {preferred_score} or above is preferred, not a hard minimum.")
     reasons.extend(missing_checks)
     return reasons, "needs_information" if missing_checks else "potential"
+
+
+MATCH_CANDIDATE_SQL = text("""
+    SELECT a.id AS applicant_id, p.id AS product_id, p.criteria_version, p.lender,
+           segment.rules AS segment_rules
+    FROM applicants AS a
+    JOIN loan_products AS p
+      ON p.status = 'verified'
+     AND p.last_checked_at >= :cutoff
+     AND a.country_code = COALESCE(p.criteria->>'country_code', a.country_code)
+     AND a.currency = COALESCE(p.criteria->>'currency', a.currency)
+    CROSS JOIN LATERAL jsonb_each(
+      CASE WHEN jsonb_typeof(p.criteria->'segments') = 'object'
+           THEN p.criteria->'segments' ELSE '{}'::jsonb END
+    ) AS segment(segment_name, rules)
+    WHERE a.batch_id = :batch_id
+      AND a.employment_segment = CASE
+            WHEN lower(replace(segment.segment_name, '_', '-')) LIKE '%self%' THEN 'self-employed'
+            WHEN lower(replace(segment.segment_name, '_', '-')) LIKE '%salary%'
+              OR lower(replace(segment.segment_name, '_', '-')) LIKE '%salaried%'
+              OR lower(replace(segment.segment_name, '_', '-')) LIKE '%employ%' THEN 'salaried'
+            ELSE lower(replace(segment.segment_name, '_', '-'))
+          END
+      AND a.monthly_income >= COALESCE(
+            NULLIF(segment.rules->>'minimum_monthly_income_inr', '')::numeric,
+            (SELECT MIN(threshold.value::numeric)
+             FROM jsonb_each_text(
+                 CASE WHEN jsonb_typeof(segment.rules->'income_thresholds_by_sector_inr') = 'object'
+                      THEN segment.rules->'income_thresholds_by_sector_inr' ELSE '{}'::jsonb END
+             ) AS threshold(key, value)),
+            0
+          )
+      AND (NULLIF(segment.rules->>'min_age', '') IS NULL
+           OR a.age >= (segment.rules->>'min_age')::integer)
+      AND (NULLIF(segment.rules->>'max_age', '') IS NULL
+           OR a.age <= (segment.rules->>'max_age')::integer)
+      AND (NULLIF(segment.rules->>'min_credit_score', '') IS NULL
+           OR a.credit_score >= (segment.rules->>'min_credit_score')::integer)
+      AND (NULLIF(segment.rules->>'max_credit_score', '') IS NULL
+           OR a.credit_score <= (segment.rules->>'max_credit_score')::integer)
+      AND NOT EXISTS (
+          SELECT 1 FROM loan_matches AS existing
+          WHERE existing.applicant_id = a.id AND existing.product_id = p.id
+            AND existing.criteria_version = p.criteria_version
+      )
+""")
+
+
+@app.post("/api/workflows/match-candidates")
+def prepare_match_candidates(
+    payload: dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    _service: None = Depends(require_workflow_token),
+) -> dict[str, Any]:
+    """Return privacy-minimized SQL candidates for n8n's rule-evaluation Code node."""
+    batch_id = str(payload.get("batch_id", "")).strip()
+    batch = db.get(UploadBatch, batch_id) if batch_id else None
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Upload batch not found")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    active_products = db.scalars(select(LoanProduct).where(
+        LoanProduct.status == "verified", LoanProduct.last_checked_at >= cutoff
+    ).order_by(LoanProduct.id)).all()
+    product_count = len(active_products)
+    criteria_fingerprint = hashlib.sha256(json.dumps([
+        {"id": product.id, "version": product.criteria_version, "criteria": product.criteria}
+        for product in active_products
+    ], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:job_key))"), {
+        "job_key": f"{batch_id}:{criteria_fingerprint}"
+    })
+    job = db.scalar(select(MatchJob).where(
+        MatchJob.batch_id == batch_id,
+        MatchJob.criteria_fingerprint == criteria_fingerprint,
+    ).with_for_update())
+    if job and job.status == "completed":
+        return {
+            "job_id": job.id,
+            "batch_id": batch_id,
+            "criteria_fingerprint": criteria_fingerprint,
+            "applicants_checked": job.result.get("applicants_checked", 0),
+            "verified_products_checked": job.result.get("verified_products_checked", product_count),
+            "candidates": [],
+            "candidate_pairs": 0,
+            "idempotent_replay": True,
+            "result": job.result,
+        }
+    if job and job.status == "running" and job.started_at and job.started_at >= datetime.now(timezone.utc) - timedelta(minutes=30):
+        raise HTTPException(status_code=409, detail="A matching job for this batch and criteria version is already running")
+    if job is None:
+        job = MatchJob(batch_id=batch_id, criteria_fingerprint=criteria_fingerprint)
+        db.add(job)
+        db.flush()
+    job.status = "running"
+    job.attempt += 1
+    job.error = None
+    job.started_at = datetime.now(timezone.utc)
+    job.finished_at = None
+    record_event(db, batch.workspace_id, "matching", "running", "SQL candidate reduction started",
+                 batch_id=batch_id, job_id=job.id, details={"attempt": job.attempt})
+    db.commit()
+
+    applicant_count = db.scalar(select(func.count()).select_from(Applicant).where(Applicant.batch_id == batch_id)) or 0
+    try:
+        with engine.connect().execution_options(stream_results=True) as candidate_connection:
+            candidate_rows = candidate_connection.execute(
+                MATCH_CANDIDATE_SQL, {"batch_id": batch_id, "cutoff": cutoff}
+            ).mappings()
+            candidates = [dict(candidate) for candidate in candidate_rows]
+    except Exception as exc:
+        failed_job = db.get(MatchJob, job.id)
+        if failed_job:
+            failed_job.status = "failed"
+            failed_job.error = str(exc)[:1000]
+            failed_job.finished_at = datetime.now(timezone.utc)
+            record_event(db, batch.workspace_id, "matching", "failed", "SQL candidate reduction failed",
+                         batch_id=batch_id, job_id=job.id,
+                         details={"attempt": failed_job.attempt, "error": failed_job.error})
+            db.commit()
+        raise
+
+    return {
+        "job_id": job.id,
+        "batch_id": batch_id,
+        "criteria_fingerprint": criteria_fingerprint,
+        "applicants_checked": applicant_count,
+        "verified_products_checked": product_count,
+        "candidate_pairs": len(candidates),
+        "candidates": candidates,
+        "idempotent_replay": False,
+    }
+
+
+@app.post("/api/workflows/match-results")
+def persist_match_results(
+    payload: dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+    _service: None = Depends(require_workflow_token),
+) -> dict[str, Any]:
+    """Persist n8n-evaluated candidates in bounded SQL insert chunks."""
+    batch_id = str(payload.get("batch_id", "")).strip()
+    job_id = str(payload.get("job_id", "")).strip()
+    fingerprint = str(payload.get("criteria_fingerprint", "")).strip()
+    matches = payload.get("matches")
+    if not batch_id or not job_id or not fingerprint or not isinstance(matches, list):
+        raise HTTPException(status_code=400, detail="job_id, batch_id, criteria_fingerprint, and matches are required")
+    if len(matches) > 50000:
+        raise HTTPException(status_code=413, detail="A workflow result page may contain at most 50,000 candidates")
+    job = db.scalar(select(MatchJob).where(MatchJob.id == job_id, MatchJob.batch_id == batch_id).with_for_update())
+    if job is None:
+        raise HTTPException(status_code=404, detail="Matching job not found")
+    if job.status == "completed":
+        return {**(job.result or {}), "job_id": job.id, "idempotent_replay": True}
+    if job.status != "running" or job.criteria_fingerprint != fingerprint:
+        raise HTTPException(status_code=409, detail="Matching job state or criteria version changed")
+
+    rows: list[dict[str, Any]] = []
+    for item in matches:
+        try:
+            applicant_id = int(item["applicant_id"])
+            product_id = int(item["product_id"])
+            criteria_version = int(item["criteria_version"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="A candidate is missing valid applicant, product, or criteria IDs")
+        match_status = str(item.get("match_status", ""))
+        reasons = item.get("reasons")
+        if match_status not in {"potential", "needs_information"} or not isinstance(reasons, list) or len(reasons) > 20:
+            raise HTTPException(status_code=400, detail="A candidate has invalid match status or reasons")
+        rows.append({
+            "applicant_id": applicant_id,
+            "product_id": product_id,
+            "criteria_version": criteria_version,
+            "batch_id": batch_id,
+            "reasons": [str(reason)[:500] for reason in reasons],
+            "match_status": match_status,
+            "notification_status": "pending",
+        })
+
+    try:
+        created_matches = 0
+        for offset in range(0, len(rows), MATCH_INSERT_CHUNK_SIZE):
+            result = db.execute(
+                pg_insert(Match).values(rows[offset:offset + MATCH_INSERT_CHUNK_SIZE]).on_conflict_do_nothing(
+                    index_elements=[Match.applicant_id, Match.product_id, Match.criteria_version]
+                )
+            ) if rows[offset:offset + MATCH_INSERT_CHUNK_SIZE] else None
+            created_matches += (result.rowcount or 0) if result is not None else 0
+        job.progress_pairs = len(rows)
+        job.created_matches = created_matches
+        job.needs_information_pairs = sum(row["match_status"] == "needs_information" for row in rows)
+        result_payload = {
+            "job_id": job.id,
+            "batch_id": batch_id,
+            "status": "completed",
+            "attempt": job.attempt,
+            "criteria_fingerprint": fingerprint,
+            "applicants_checked": int(payload.get("applicants_checked", 0)),
+            "verified_products_checked": int(payload.get("verified_products_checked", 0)),
+            "candidate_pairs_evaluated": job.progress_pairs,
+            "potential_matches_created": job.created_matches,
+            "needs_information_pairs": job.needs_information_pairs,
+            "note": "Potential matches are informational only; lenders make final eligibility and pricing decisions.",
+        }
+        job.status = "completed"
+        job.result = result_payload
+        job.finished_at = datetime.now(timezone.utc)
+        batch = db.get(UploadBatch, batch_id)
+        if batch:
+            record_event(db, batch.workspace_id, "matching", "completed", "n8n rule evaluation and bulk persistence completed",
+                         batch_id=batch_id, job_id=job.id, details={
+                             "candidate_pairs_evaluated": job.progress_pairs,
+                             "created_matches": job.created_matches,
+                             "needs_information_pairs": job.needs_information_pairs,
+                             "attempt": job.attempt,
+                         })
+        db.commit()
+        return {**result_payload, "idempotent_replay": False}
+    except Exception as exc:
+        db.rollback()
+        failed_job = db.get(MatchJob, job_id)
+        if failed_job:
+            failed_job.status = "failed"
+            failed_job.error = str(exc)[:1000]
+            failed_job.finished_at = datetime.now(timezone.utc)
+            db.commit()
+        raise
 
 
 @app.post("/api/workflows/match")

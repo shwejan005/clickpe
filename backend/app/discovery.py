@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from urllib.robotparser import RobotFileParser
 from datetime import datetime, timezone
 from typing import Any
@@ -228,19 +229,33 @@ def _gemini_criteria_proposal(source: dict[str, str], page: dict[str, Any], dete
     )
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     try:
-        response = requests.post(
-            endpoint,
-            headers={"Content-Type": "application/json", "X-goog-api-key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "responseSchema": response_schema,
-                    "temperature": 0,
-                },
-            },
-            timeout=35,
-        )
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers={"Content-Type": "application/json", "X-goog-api-key": api_key},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "responseMimeType": "application/json",
+                            "responseSchema": response_schema,
+                            "temperature": 0,
+                        },
+                    },
+                    timeout=75,
+                )
+            except requests.Timeout:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+            # Retry only transient gateway/timeout codes. A 429 here is a daily
+            # free-tier quota cap whose retryDelay is hours away, and retrying
+            # would burn the remaining budget; fail fast instead.
+            if response.status_code in {408, 502, 503, 504} and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            break
         if not response.ok:
             return {"status": "failed", "error": f"Gemini returned HTTP {response.status_code}"}
         payload = response.json()

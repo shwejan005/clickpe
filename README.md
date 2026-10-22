@@ -11,7 +11,7 @@ The Firebase web app configuration belongs in the local `.env` as `VITE_FIREBASE
 3. In **Project settings → Service accounts**, generate a Firebase Admin SDK private key. Save it as `secrets/firebase-service-account.json`. Keep this JSON private and never commit it; `secrets/` is ignored and mounted read-only into the API container.
 4. Set `FIREBASE_PROJECT_ID` to the Firebase project ID and `FIREBASE_BOOTSTRAP_ADMIN_EMAIL` to the verified Google account that should become the first workspace and criteria administrator. This is the app administrator account, separate from the n8n owner account.
 
-The API creates an HttpOnly Firebase session cookie after verifying the ID token and verified email. New users need a workspace invite; the configured bootstrap admin is provisioned automatically. Workspace admins can invite analysts or viewers in **Team & access**; the platform admin can grant or remove criteria-review access for workspace members there. Criteria approval uses the signed-in platform reviewer role; there is no pasted review token.
+The API creates an HttpOnly Firebase session cookie after verifying the ID token and verified email. A first-time Google sign-in automatically creates a private workspace for that user, so individual Firebase user setup or an invitation is not required. Existing workspace invitations still let teammates join an established workspace. The configured bootstrap admin is provisioned automatically and can grant or remove criteria-review access for workspace members; regular workspace admins can invite analysts or viewers in **Team & access**. Criteria approval uses the signed-in platform reviewer role; there is no pasted review token.
 
 ## 2. Configure local services
 
@@ -20,19 +20,25 @@ The API creates an HttpOnly Firebase session cookie after verifying the ID token
 3. Start/rebuild from the project root: `docker compose up --build -d`.
 4. Open the dashboard at http://localhost:5173, API docs at http://localhost:8000/docs, n8n at http://localhost:5678, and Mailpit at http://localhost:8025. PostgreSQL is exposed on host port `5433` (container port `5432`).
 
-The API reads Firebase Admin credentials from `/run/secrets/firebase-service-account.json`. If the local credential file or bootstrap email is absent, Firebase sign-in/workspace provisioning cannot complete; the Operations screen reports Firebase readiness.
+The API reads Firebase Admin credentials from `/run/secrets/firebase-service-account.json`. The Google provider must be enabled in Firebase Authentication, and the local credential file must be available to the API. A bootstrap admin email is optional; without one, new users still receive private workspaces but no platform-level review access. The Operations screen reports Firebase readiness.
 
 ## 3. n8n workflows
 
-Import the three JSON files from `workflows/` if starting with an empty n8n volume:
+For a fresh n8n volume, import and publish all workflows with:
+
+```sh
+./scripts/import-n8n-workflows.sh
+```
+
+On the AWS host, the script auto-detects `docker-compose.aws.yml`; it stops n8n, imports and publishes all three workflows offline to avoid SQLite locks, then starts n8n so schedules and webhooks register.
+
+The workflows are:
 
 - `product-discovery.json` — daily lender source refresh and criteria-review queue.
 - `user-loan-matching.json` — new-batch webhook, set-based SQL matching, and notification handoff.
 - `user-notifications.json` — bounded messages delivered through Mailpit locally or SES on AWS.
 
-Assign an SMTP credential to the notification email node with host `mailpit`, port `1025`, and no TLS/authentication. The active local workflows have been updated to read `N8N_SERVICE_TOKEN` from the n8n runtime environment for API calls. Do not put this token into workflow JSON. Recreate/restart n8n after changing `.env` so the container receives the token. Workflow exports use the same environment expression and contain no key value.
-
-Workflow exports are inactive; after importing into a fresh n8n volume, assign the Mailpit credential and activate the schedule and webhook workflows.
+The local notification branch sends to Mailpit's local HTTP API and needs no SMTP credential. On AWS, `scripts/import-n8n-workflows.sh` creates the n8n AWS Assume Role credential from `N8N_SES_ROLE_ARN` and `N8N_SES_EXTERNAL_ID` in the host `.env`, then assigns it to the SES node. It uses EC2 system credentials, not long-lived keys. The deployed credential now assumes the SES role successfully. The workflows read `N8N_SERVICE_TOKEN` from the n8n runtime environment for internal API calls. Do not put this token into workflow JSON. Recreate/restart n8n after changing `.env` so the container receives the token.
 
 ## Dashboard pages
 
@@ -84,69 +90,32 @@ flowchart LR
   end
 ```
 
-The n8n workflows orchestrate discovery, matching, and notifications. The API owns database transactions, row validation, SQL candidate filtering, and safe test-recipient construction; workflows call its authenticated internal endpoints. Matching first applies income, score, employment, and age criteria in PostgreSQL, then records outcomes with criteria versions. Applicant records are not sent to the LLM. This keeps pair evaluation set-based and avoids an LLM call for each user/product pair.
+The n8n workflows orchestrate discovery, matching, and notifications. The API owns database transactions, row validation, SQL candidate filtering, bulk persistence, and safe test-recipient construction. Workflow B receives only the reduced candidate pairs and public product criteria from the SQL prefilter; its Code node evaluates the remaining rule checks and match status, then the API stores the results in chunks under criteria-version uniqueness. Applicant contact details never enter that matching node, and applicant records are not sent to the LLM. This avoids an LLM call for each user/product pair while keeping the pair-level decision step in n8n.
 
 ### Workflow and filtering details
 
 - **Workflow A — discovery:** a daily schedule fetches the allow-listed lender pages (SBI, HDFC, and ICICI), extracts product/rate/eligibility facts, stores deterministic results with source links and freshness, and queues incomplete Gemini-assisted criteria for a human reviewer. Unapproved or stale criteria stay out of matching.
-- **Workflow B — matching:** an authenticated batch webhook calls the API's matching operation, which applies SQL filters and persists matches in chunks under criteria-version uniqueness. This keeps the authoritative user data and transaction logic inside the API/PostgreSQL boundary while n8n controls the sequence and retry entry point.
+- **Workflow B — matching:** an authenticated batch webhook calls a database-side prefilter for country, currency, employment segment, income floor, age, score, and already-matched criteria versions. An n8n Code node evaluates the reduced pairs, marks potential matches or missing-information cases, and passes results to the API for idempotent chunked persistence.
 - **Workflow C — notification:** after matching, the workflow claims a bounded page, creates one test-inbox message per applicant, branches to SES or Mailpit, acknowledges each delivery, and requests another page only when the claim says work remains. The destination comes from `NOTIFICATION_TEST_RECIPIENT`; applicant CSV emails are never used.
 
 The local 10,000-row evidence recorded 6,778 candidate pairs against two verified products, versus 20,000 pairs in a naive all-pairs pass: 66.11% fewer pairs, with 6,778 database inserts in about 2.08 seconds on that local fixture. All saved rows needed additional information because the sample CSV lacks lender-specific fields such as tenure or salary-account relationship. This is a fixture-specific baseline, not an AWS capacity guarantee or a loan approval result. See [PLAN.md](PLAN.md) for the fuller audit and limits.
 
-## AWS deployment mode
+## AWS deployment mode — deployed short-lived environment
 
-The AWS files are included but have not been deployed from this workspace. They provision a private encrypted S3 bucket, event-driven ingestion Lambda, API Gateway presign endpoint, private PostgreSQL RDS, private VPC subnets and endpoints, CloudWatch logs and a dead-letter queue, an SES sender identity, and an IAM role/profile for an n8n EC2 host. The EC2 instance itself is created by you so you can choose its size and control its lifetime. AWS resources can incur charges; remove the stack and EC2 host when the demo is finished.
+The development deployment is live in `ap-south-1`. It uses API Gateway + Lambda + private S3/RDS for CSV ingestion, with the dashboard/API/n8n containers on a small EC2 host behind Caddy HTTPS. The full topology, current URLs and resource inventory, deployment steps, validation results, capacity limits, and cleanup instructions are in [docs/AWS-DEPLOYMENT.md](docs/AWS-DEPLOYMENT.md).
 
-### 1. Prepare credentials and DNS
+- Dashboard: https://app.3.109.132.243.nip.io
+- API: https://api.3.109.132.243.nip.io (`/api/health`, `/docs`)
+- n8n: https://n8n.3.109.132.243.nip.io (`/healthz`)
+- Upload presign route: `POST https://api.3.109.132.243.nip.io/uploads/presign` (Caddy proxies to API Gateway so the same-site Firebase session cookie reaches the authorizer)
 
-1. Copy `.env.example` to `.env`; leave local settings as needed and fill the AWS settings for your account. Keep `.env` private. The Serverless Framework v3 config loads this file with `useDotenv: true`.
-2. Configure AWS CLI credentials using your own short-lived deployment access. Choose one AWS Region for the stack, the API Gateway custom-domain ACM certificate, and SES.
-3. Create two Secrets Manager secrets in that Region: one whose secret string is the raw Firebase Admin service-account JSON, and one whose secret string is the same random `N8N_SERVICE_TOKEN` used by the API and n8n. Set `FIREBASE_SERVICE_ACCOUNT_SECRET_ARN`, `FIREBASE_PROJECT_ID`, and `N8N_SERVICE_TOKEN_SECRET_ARN` in `.env`. Do not paste the JSON or token into workflow exports or commit them.
-4. Set `APP_ORIGIN` to the full HTTPS dashboard origin. Set `APP_DOMAIN`, `API_DOMAIN`, and `N8N_DOMAIN` to DNS names under the same parent domain so the secure Firebase session cookie can be shared. Set `SESSION_COOKIE_DOMAIN` to that parent domain, including its leading dot. Set `UPLOAD_API_DOMAIN` and provide an ACM certificate ARN in the selected Region. Add `SES_FROM_EMAIL`, which the stack registers as an SES identity.
-5. In Firebase Authentication, add the dashboard domain to authorized domains and use a verified bootstrap administrator email. Set the `FIREBASE_BOOTSTRAP_ADMIN_EMAIL` and public `VITE_FIREBASE_*` web settings in `.env`. Choose `NOTIFICATION_TEST_RECIPIENT` as an inbox you control; never use sample CSV addresses.
+The Firebase authorized domain is configured and the SES sender is verified. SES remains in sandbox. A live 10,000-row upload completed through S3 → EventBridge → Lambda → RDS → n8n matching: 10,000 accepted, zero rejected, 8,964 potential matches, all needing more information. Workflow C’s SES role credential is configured; a controlled run sent 25 messages to the test inbox and marked 68 match rows sent. The current `nip.io` URLs use an EC2 public IP, not an Elastic IP, so they may change if the instance is stopped and started. This is a demo deployment, not a production capacity/availability configuration.
 
-The app/API/n8n hostnames need DNS records pointing to the EC2 host. The upload API hostname needs a CNAME to the `UploadApiRegionalDomain` stack output; use `UploadApiRegionalHostedZoneId` if your DNS provider accepts alias records.
+### Redeploy and clean up
 
-The upload API validates the Firebase session cookie, CSRF token, workspace membership, file name, and reported size before issuing a ten-minute S3 presigned POST policy capped at 25 MB. The S3 event worker validates the actual object and uses the same CSV validator as the local API. AWS mode disables the API's direct body upload route.
+Use `./scripts/deploy-aws.sh` from the repository root with the AWS inputs in `.env`; it handles the ECR image, Serverless stack, EC2 host, Compose services, and workflow import. Do not run a raw `serverless deploy` without the image URI and temporary-credential bridge described in the deployment guide.
 
-### 2. Deploy AWS resources
-
-From the repository root, with AWS credentials configured and `.env` filled, deploy a lowercase stage name:
-
-```sh
-npx --yes serverless@3 deploy --stage demo --region ap-south-1
-```
-
-Record the stack outputs: `UploadBucketName`, `DatabaseHost`, `DatabaseSecretArn`, `UploadApiUrl`, `UploadApiRegionalDomain`, `UploadApiRegionalHostedZoneId`, `VpcId`, `PublicSubnetId`, `N8nWorkflowSecurityGroupId`, `N8nInstanceProfileArn`, `N8nSesRoleArn`, `N8nSystemCredentialsExternalId`, and `UploadIngestionDlqUrl`. RDS generates and manages the master credential in Secrets Manager; retrieve it directly into the private host `.env` for the API container. Do not put the value into shell history or this repository.
-
-### 3. Start n8n and the API host
-
-1. Launch a small EC2 instance in `PublicSubnetId`, attach `N8nWorkflowSecurityGroupId` and `N8nInstanceProfileArn`, require IMDSv2 with a response hop limit of 2 for the Dockerized n8n credential provider, and use Systems Manager Session Manager for administration. The security group opens HTTP/HTTPS publicly, allows the matching Lambda to call n8n on port 5678, and does not open SSH. Assign a stable public address and point the dashboard/API/n8n DNS records to it.
-2. On the instance, install Docker Engine and the Docker Compose plugin, check out this repository, and create a private `.env`. Set the RDS host, database name, master username/password, the shared cookie domain, app/API/n8n/upload API domains, Firebase values, SES sender, controlled `NOTIFICATION_TEST_RECIPIENT`, `N8N_ENCRYPTION_KEY`, and `N8N_SERVICE_TOKEN`. Place the Firebase Admin JSON at `secrets/firebase-service-account.json` with restricted file permissions; the API container mounts it read-only. Set `APP_ORIGIN` to the dashboard HTTPS origin.
-3. Set `N8N_MATCH_WEBHOOK` in the deployment `.env` to `http://<EC2-private-IP>:5678/webhook/loan-match`. This private route is reachable from the VPC ingestion Lambda; do not point the Lambda at the public editor URL. The AWS compose file builds the frontend in S3 upload mode and derives `VITE_UPLOAD_PRESIGN_URL` from `UPLOAD_API_DOMAIN`.
-4. Start the AWS compose stack: `docker compose -f docker-compose.aws.yml up --build -d`. The API applies Alembic migrations at startup before it serves requests. Caddy obtains HTTPS certificates once DNS points at the instance and ports 80/443 are reachable.
-5. Finish `serverless deploy` again after setting `N8N_MATCH_WEBHOOK`, so the ingestion Lambda gets the internal webhook URL. The frontend image includes the upload endpoint at build time, so rebuild it if its domains or Firebase web settings change.
-
-### 4. Import and configure n8n workflows
-
-Import `workflows/product-discovery.json`, `workflows/user-loan-matching.json`, and `workflows/user-notifications.json` into the n8n editor, then activate them. Exports are intentionally inactive until credentials and URLs are configured.
-
-- Workflow A runs on its daily schedule and updates product criteria through the API. Configure any optional LLM credential/key in the API environment; generated criteria remain pending human review.
-- Workflow B uses the `loan-match` production webhook. The ingestion Lambda sends the internal service token; the workflow passes it to the API for its set-based matching operation.
-- Workflow C's AWS SES node uses the EC2 instance role. In n8n, create an **AWS (Assume Role)** credential with the stack output `N8nSesRoleArn`, the output `N8nSystemCredentialsExternalId`, and **Use System Credentials** enabled; choose the deployed AWS Region and assign this credential to **Send through AWS SES**. The compose file enables system credentials access. Restrict n8n owner/editor access to trusted operators because anyone able to create this credential can use the host identity. Set `LOAN_NOTIFICATION_TRANSPORT=ses` and verify the SES sender and test recipient as required by your SES account mode. See [n8n AWS credentials](https://docs.n8n.io/integrations/builtin/credentials/aws/) and the [AWS SES node](https://docs.n8n.io/integrations/builtin/app-nodes/n8n-nodes-base.awsses/).
-
-The AWS workflow n8n does not need direct database credentials: it calls the API, which owns the PostgreSQL connection. In local mode, assign the SMTP node a Mailpit credential (`mailpit:1025`, no TLS or authentication). In AWS mode, assign the IAM role credential to SES. Neither path uses CSV applicant email addresses as the destination.
-
-### 5. Verify the live demo and clean up
-
-Run Workflow A, upload the provided CSV from the dashboard, inspect the import/matching run, and confirm one notification in the controlled inbox. Show a test email in the 5–10 minute demonstration video. Also show Workflow A, B, and C nodes and explain the SQL pre-filter and why there is no per-pair LLM request. This workspace has not recorded a video or sent a live SES email.
-
-When done, delete the EC2 host, empty the S3 upload bucket if unprocessed objects remain, then run `npx --yes serverless@3 remove --stage demo --region ap-south-1`. Check the stack for retained or manually-created data before deletion. RDS currently has a `DeletionPolicy: Delete`; the S3 bucket expires staged incoming files after seven days.
-
-### Remaining account actions
-
-The private GitHub repository and collaborator invitations, deployment to your AWS account, the SES inbox demonstration, video recording/hosting, and the assignment submission form require your account access. Invite `ujjwalkala-clickpe`, `HarshSrivastav-Dailype`, `ManishBiswal-clickpe`, and `tushar-clickpe` after making the repository private. Submit the repository and video links through the [assignment form](https://docs.google.com/forms/d/e/1FAIpQLSe1ET4U8rOcPM3VGJ8fT5HhigTO9fKuDlsB_wHtB5acWys9XQ/viewform). These account actions have not been performed from the workspace.
+When the demo is finished, follow the ordered teardown and data-retention warnings in [docs/AWS-DEPLOYMENT.md](docs/AWS-DEPLOYMENT.md). In particular, removing the Serverless stack deletes its RDS database, while EC2, ECR, Secrets Manager records, and the SES identity require separate cleanup.
 
 ## API overview
 

@@ -1,5 +1,4 @@
 from alembic import context
-
 from app.main import Base
 
 config = context.config
