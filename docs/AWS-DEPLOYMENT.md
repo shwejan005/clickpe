@@ -281,3 +281,5 @@ For full teardown, first export any required records and confirm the data can be
 4. Delete the separately managed ECR repository `serverless-loan-eligibility-engine-dev`, Firebase/n8n secrets under `loan-engine-dev/`, and SES identity if no longer required. Check CloudFormation, EC2, S3, RDS, ECR, Secrets Manager, SES, and billing afterward for leftovers.
 
 The complete deployment plan and remaining assignment actions are tracked in [`PLAN.md`](../PLAN.md). Local Docker Compose usage remains documented in [`README.md`](../README.md).
+
+Automated main-branch application delivery is described in [`CICD.md`](CICD.md). Infrastructure changes remain a deliberate Serverless deployment rather than being granted to the GitHub Actions role.

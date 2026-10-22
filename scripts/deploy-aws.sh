@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 # One-shot AWS deployment orchestrator for the loan-eligibility-engine.
 # Prereqs: .env filled per the ".env.example AWS deployment inputs" section
 # (except values this script fills for you: *_SECRET_ARN, UPLOAD_*), AWS creds
@@ -44,7 +44,7 @@ trap cleanup_ssh_ingress EXIT
 
 # ── requirement checks ────────────────────────────────────────────────────────
 for v in FIREBASE_PROJECT_ID FIREBASE_BOOTSTRAP_ADMIN_EMAIL N8N_SERVICE_TOKEN N8N_ENCRYPTION_KEY SES_FROM_EMAIL; do
-  if [ -z "${(P)v:-}" ]; then echo "Missing required env: $v (see .env.example AWS section)"; exit 1; fi
+  if [ -z "$(printenv "$v" || true)" ]; then echo "Missing required env: $v (see .env.example AWS section)"; exit 1; fi
 done
 
 # ── 1. Secrets Manager ────────────────────────────────────────────────────────

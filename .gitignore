@@ -2,6 +2,8 @@
 .env.*
 !.env.example
 *.pem
+.DS_Store
+.DS_Store
 **/__pycache__/
 **/*.py[cod]
 **/node_modules/

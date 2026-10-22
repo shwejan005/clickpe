@@ -1,0 +1,166 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Reusable CI checks
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  deploy:
+    name: Deploy tested main to AWS dev
+    needs: [checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: loan-engine-aws-dev
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ap-south-1
+      AWS_ACCOUNT_ID: '361769587257'
+      AWS_ROLE_ARN: arn:aws:iam::361769587257:role/loan-eligibility-engine-dev-github-actions
+      ECR_REPOSITORY: serverless-loan-eligibility-engine-dev
+      ECR_IMAGE_URI: 361769587257.dkr.ecr.ap-south-1.amazonaws.com/serverless-loan-eligibility-engine-dev:upload-worker
+      ARTIFACT_BUCKET: loan-eligibility-engine-dev-361769587257-ap-south-1
+      EC2_INSTANCE_ID: i-0cb308850a3de1a5a
+    steps:
+      - name: Check out the exact commit that passed CI
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure short-lived AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-main-${{ github.run_id }}
+      - name: Verify deployment account
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$AWS_ACCOUNT_ID"
+      - name: Log in to ECR
+        run: aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - name: Build and publish the Lambda worker image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --output type=docker,dest=/tmp/loan-engine-upload-worker.tar \
+            --tag loan-engine-upload-worker:ci \
+            --file backend/Dockerfile.lambda backend
+          docker load --input /tmp/loan-engine-upload-worker.tar
+          docker tag loan-engine-upload-worker:ci "$ECR_IMAGE_URI"
+          docker push "$ECR_IMAGE_URI"
+          media_type=$(aws ecr describe-images \
+            --region "$AWS_REGION" \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag=upload-worker \
+            --query 'imageDetails[0].imageManifestMediaType' \
+            --output text)
+          if [[ "$media_type" == *image.index* || "$media_type" == *manifest.list* ]]; then
+            echo "Lambda does not accept this multi-platform image manifest: $media_type" >&2
+            exit 1
+          fi
+          echo "Published Lambda image manifest: $media_type"
+      - name: Update Lambda functions to the new image
+        run: |
+          for function in \
+            loan-eligibility-engine-dev-firebaseSessionAuthorizer \
+            loan-eligibility-engine-dev-presignUpload \
+            loan-eligibility-engine-dev-ingestS3Upload
+          do
+            aws lambda update-function-code \
+              --region "$AWS_REGION" \
+              --function-name "$function" \
+              --image-uri "$ECR_IMAGE_URI" >/dev/null
+            aws lambda wait function-updated-v2 --region "$AWS_REGION" --function-name "$function"
+          done
+      - name: Package and upload source artifact
+        run: |
+          COPYFILE_DISABLE=1 tar \
+            --exclude='node_modules' \
+            --exclude='**/node_modules/**' \
+            --exclude='.git' \
+            --exclude='.serverless' \
+            --exclude='uploads/*' \
+            --exclude='secrets/*' \
+            --exclude='.env*' \
+            --exclude='*.pem' \
+            --exclude='.DS_Store' \
+            -czf "/tmp/loan-engine-${GITHUB_SHA}.tar.gz" \
+            backend frontend workflows scripts docker-compose.aws.yml Caddyfile
+          aws s3 cp "/tmp/loan-engine-${GITHUB_SHA}.tar.gz" \
+            "s3://${ARTIFACT_BUCKET}/deployments/${GITHUB_SHA}.tar.gz" \
+            --region "$AWS_REGION" --only-show-errors
+      - name: Detect workflow definition changes
+        id: changes
+        shell: bash
+        run: |
+          before=$(git rev-parse "${GITHUB_SHA}^1")
+          if git diff --name-only "$before" "$GITHUB_SHA" -- workflows/ | grep -q .; then
+            echo 'workflows=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'workflows=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy application containers through SSM
+        env:
+          WORKFLOWS_CHANGED: ${{ steps.changes.outputs.workflows }}
+        run: |
+          python3 - <<'PY' > /tmp/ssm-parameters.json
+          import json
+          import os
+
+          sha = os.environ['GITHUB_SHA']
+          bucket = os.environ['ARTIFACT_BUCKET']
+          region = os.environ['AWS_REGION']
+          commands = [
+              'set -euo pipefail',
+              f'aws s3 cp s3://{bucket}/deployments/{sha}.tar.gz /tmp/loan-engine-deploy.tar.gz --region {region} --only-show-errors',
+              'sudo tar -xzf /tmp/loan-engine-deploy.tar.gz -C /opt/loan-engine',
+              'cd /opt/loan-engine',
+              'sudo docker compose -f docker-compose.aws.yml up -d --build api frontend caddy n8n',
+              'sudo docker compose -f docker-compose.aws.yml restart caddy',
+          ]
+          if os.environ.get('WORKFLOWS_CHANGED') == 'true':
+              commands.append('cd /opt/loan-engine && sudo sh scripts/import-n8n-workflows.sh')
+          commands.append('rm -f /tmp/loan-engine-deploy.tar.gz')
+          print(json.dumps({'commands': commands}))
+          PY
+          command_id=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --timeout-seconds 3600 \
+            --parameters file:///tmp/ssm-parameters.json \
+            --query Command.CommandId --output text)
+          echo "SSM deployment command: $command_id"
+          for attempt in $(seq 1 270); do
+            status=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" --command-id "$command_id" \
+              --instance-id "$EC2_INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation --region "$AWS_REGION" \
+                  --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" \
+                  --query '[Status,StandardOutputContent,StandardErrorContent]' --output json
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          if [[ "$status" != Success ]]; then
+            echo "SSM deploy did not finish successfully (status=$status)" >&2
+            exit 1
+          fi
+      - name: Smoke test live endpoints
+        run: |
+          curl --fail --silent --show-error --max-time 20 https://api.3.109.132.243.nip.io/api/health | jq -e '.status == "ok"'
+          curl --fail --silent --show-error --max-time 20 https://n8n.3.109.132.243.nip.io/healthz >/dev/null
