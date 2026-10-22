@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  GitHub Actions OIDC identity — limits main-branch automation to publishing
+  this application's Lambda image and deploying code to its tagged EC2 host.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@v3
+  com.aws.cloudformation.Context:
+    arch: GitHub main -> OIDC role -> ECR/Lambda, private S3 deployment prefix, and one EC2 instance through SSM.
+    must:
+      - Trust only the exact repository main ref and sts.amazonaws.com audience.
+      - Restrict artifact writes to deployments/ and commands to the tagged app instance.
+      - Keep this role free of IAM, CloudFormation, Secrets Manager, and SES permissions.
+    ref:
+      - at: docs/CICD.md
+        has: GitHub Actions trust boundary and deployment flow
+        scope: companion
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: shwejan005/clickpe
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+  DeploymentBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  EcrRepositoryName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9-_/]{1,254}$'
+  Ec2InstanceId:
+    Type: String
+    AllowedPattern: '^i-[0-9a-f]+$'
+  LambdaNamePrefix:
+    Type: String
+    Default: loan-eligibility-engine-dev-
+    AllowedPattern: '^[A-Za-z0-9-_]+$'
+Resources:
+  GitHubActionsOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Federates GitHub Actions through short-lived OIDC tokens rather than stored AWS access keys.
+        must:
+          - Keep sts.amazonaws.com as the client audience.
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: project
+          Value: loan-eligibility-engine
+        - Key: stage
+          Value: !Ref Stage
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Allows only main-branch Actions to publish the Lambda worker image, update this app's three functions, upload a short-lived source artifact, and deploy it to the app EC2 host through SSM.
+        must:
+          - Trust only the configured repository main branch; pull-request workflows get no AWS role.
+          - Limit Lambda updates to the loan-engine functions, S3 writes to deployments/, and SSM commands to the loan-engine instance.
+          - Never grant IAM, CloudFormation, Secrets Manager, or SES permissions to this CI role.
+    Properties:
+      RoleName: !Sub loan-eligibility-engine-${Stage}-github-actions
+      Description: GitHub Actions OIDC deployment role for the loan-engine application
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubActionsOidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:ref:refs/heads/main
+      Policies:
+        - PolicyName: PushLoanEngineLambdaImage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+        - PolicyName: UpdateLoanEngineLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaNamePrefix}firebaseSessionAuthorizer
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaNamePrefix}presignUpload
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaNamePrefix}ingestS3Upload
+        - PolicyName: UploadShortLivedDeploymentArtifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}/deployments/*
+        - PolicyName: DeployTaggedEc2HostThroughSsm
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Ec2InstanceId}
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/project: loan-eligibility-engine
+                    ssm:resourceTag/stage: !Ref Stage
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: '*'
+      Tags:
+        - Key: project
+          Value: loan-eligibility-engine
+        - Key: stage
+          Value: !Ref Stage
+
+Outputs:
+  GitHubActionsDeployRoleArn:
+    Description: Set as the role-to-assume in the main-branch deployment job
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+  GitHubActionsOidcProviderArn:
+    Description: GitHub Actions OIDC provider ARN
+    Value: !Ref GitHubActionsOidcProvider

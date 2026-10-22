@@ -113,6 +113,23 @@ functions:
       N8N_MATCH_WEBHOOK: ${env:N8N_MATCH_WEBHOOK, 'http://localhost:5678/webhook/loan-match'}
       N8N_SERVICE_TOKEN_SECRET_ARN: ${env:N8N_SERVICE_TOKEN_SECRET_ARN}
 resources:
+  Description: >-
+    Loan eligibility upload and matching pipeline — uses private S3/RDS and
+    event-driven Lambda ingestion while keeping n8n and the application on a
+    small EC2 host for the temporary demo environment.
+  Metadata:
+    AWSToolsMetrics:
+      AWSAgentToolkit: aws-cloudformation@v3
+    com.aws.cloudformation.Context:
+      arch: Browser -> API Gateway presign -> S3/EventBridge/Lambda -> private RDS -> n8n/SES; EC2 API owns database application operations.
+      must:
+        - RDS remains private and encrypted; only application/Lambda security groups reach PostgreSQL.
+        - Applicant objects remain private; only incoming/ objects trigger ingestion.
+        - CI deployment artifacts use a separate deployments/ prefix with finite retention.
+      ref:
+        - at: docs/AWS-DEPLOYMENT.md
+          has: deployed topology, CI/CD deployment path, validation status, and capacity limits
+          scope: companion
   Resources:
     LoanVpc:
       Type: AWS::EC2::VPC
@@ -395,6 +412,13 @@ resources:
 
     ApplicantUploads:
       Type: AWS::S3::Bucket
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Private CSV staging plus short-lived CI deployment artifacts; object-event rule is separately limited to incoming/.
+          must:
+            - Preserve all public-access blocks, default encryption, and upload-origin CORS.
+            - Keep applicant uploads and deployment bundles on separate prefixes with separate expiration rules.
+          mutable: change-with-constraints
       Properties:
         BucketName: ${self:custom.uploadBucketName}
         PublicAccessBlockConfiguration:
@@ -423,9 +447,36 @@ resources:
               Status: Enabled
               Prefix: incoming/
               ExpirationInDays: 7
+            - Id: ExpireCICDDeploymentArtifacts
+              Status: Enabled
+              Prefix: deployments/
+              ExpirationInDays: 14
         NotificationConfiguration:
           EventBridgeConfiguration:
             EventBridgeEnabled: true
+
+    ApplicantUploadsTlsPolicy:
+      Type: AWS::S3::BucketPolicy
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: Rejects plaintext requests to the applicant and deployment artifact bucket.
+          must:
+            - Preserve the aws:SecureTransport deny for both bucket and object ARNs.
+      Properties:
+        Bucket: { Ref: ApplicantUploads }
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: DenyInsecureTransport
+              Effect: Deny
+              Principal: '*'
+              Action: s3:*
+              Resource:
+                - arn:aws:s3:::${self:custom.uploadBucketName}
+                - arn:aws:s3:::${self:custom.uploadBucketName}/*
+              Condition:
+                Bool:
+                  aws:SecureTransport: 'false'
 
     UploadIngestionDlq:
       Type: AWS::SQS::Queue
@@ -501,6 +552,13 @@ resources:
 
     N8nSesRole:
       Type: AWS::IAM::Role
+      Metadata:
+        com.aws.cloudformation.Context:
+          why: EC2 instance profile for SSM administration and controlled SES sends; also reads short-lived CI artifacts from one private S3 prefix.
+          must:
+            - Keep SES sends scoped to the configured sender identity.
+            - Keep deployment artifact reads scoped to deployments/; never grant applicant-object reads to the host role.
+          mutable: change-with-constraints
       Properties:
         RoleName: ${self:service}-${sls:stage}-n8n-ses
         AssumeRolePolicyDocument:
@@ -534,6 +592,12 @@ resources:
                 - Effect: Allow
                   Action: sts:AssumeRole
                   Resource: arn:aws:iam::${aws:accountId}:role/${self:service}-${sls:stage}-n8n-ses
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucketName}/deployments/*
+                - Effect: Allow
+                  Action: s3:GetBucketLocation
+                  Resource: arn:aws:s3:::${self:custom.uploadBucketName}
         Tags:
           - Key: Name
             Value: ${self:service}-${sls:stage}-n8n-ses-role

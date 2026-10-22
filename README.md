@@ -2,6 +2,8 @@
 
 The local stack includes a React + Tailwind dashboard, FastAPI, PostgreSQL, n8n, and Mailpit. It supports CSV ingestion, deterministic SQL matching, sourced lender-product data, an optional Gemini-assisted criteria proposal that requires a reviewer, and controlled test notifications.
 
+For the timed, recording-ready assignment walkthrough, see [the 10-minute demo script](docs/DEMO-SCRIPT.md).
+
 ## 1. Configure Firebase sign-in
 
 The Firebase web app configuration belongs in the local `.env` as `VITE_FIREBASE_*` values. These values identify the client app and are not server credentials. In Firebase Console:
@@ -103,6 +105,10 @@ The local 10,000-row evidence recorded 6,778 candidate pairs against two verifie
 ## AWS deployment mode — deployed short-lived environment
 
 The development deployment is live in `ap-south-1`. It uses API Gateway + Lambda + private S3/RDS for CSV ingestion, with the dashboard/API/n8n containers on a small EC2 host behind Caddy HTTPS. The full topology, current URLs and resource inventory, deployment steps, validation results, capacity limits, and cleanup instructions are in [docs/AWS-DEPLOYMENT.md](docs/AWS-DEPLOYMENT.md).
+
+GitHub Actions CI and OIDC-based continuous delivery are documented in [docs/CICD.md](docs/CICD.md).
+
+GitHub Actions CI/CD and the AWS OIDC release path are documented in [docs/CICD.md](docs/CICD.md).
 
 - Dashboard: https://app.3.109.132.243.nip.io
 - API: https://api.3.109.132.243.nip.io (`/api/health`, `/docs`)
